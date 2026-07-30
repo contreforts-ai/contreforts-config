@@ -26,6 +26,10 @@ serde = { workspace = true }
 # `connector_iri`, ...) lives here since D3b (contreforts/contreforts-workspace#58,
 # comment 7833) -- neither store crate depends on the other for it.
 contreforts-core = { workspace = true }
+# Percent-encoding a KG instance's label into its own definition-record subject IRI
+# (contreforts-workspace#58 D4), matching every other label-scoped IRI builder in
+# `contreforts-core::namespaces`.
+urlencoding = { workspace = true }
 # contreforts/contreforts-workspace#58 (comment 7791), item D3a: server-side
 # SHACL validation of connector writes lives below both store crates. Not
 # `{ workspace = true }`: this crate is not in the root workspace's
