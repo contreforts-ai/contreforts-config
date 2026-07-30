@@ -8,15 +8,38 @@
 //! contreforts/contreforts-workspace#18 for the design this crate exists to
 //! satisfy.
 //!
-//! Nothing here is populated from the generalised configuration layer yet —
-//! that is contreforts-workspace#58 D3 onward. This crate deliberately does
-//! not depend on `contreforts-kg` or `contreforts-core`, and does not move or
-//! copy `config_graph.rs`.
+//! D3c (contreforts/contreforts-workspace#58, comment 7904) populates this crate from the
+//! generalised config-graph engine (`config_graph` module below): the 11 `*ConnectorConfig`
+//! structs, the `ConnectorDescriptor` table and `write_connector`, and their thin per-kind
+//! wrappers, ported from `contreforts-kg/src/config_graph.rs` to run against [`ConfigStore`]
+//! instead of `contreforts_kg::GraphStore`. This crate depends on `contreforts-core` (shared
+//! vocabulary, D3b) and `contreforts-declaration` (connector-instance SHACL validation, D3a) --
+//! it still does not, and must not, depend on `contreforts-kg`.
+
+pub mod config_graph;
+pub mod error;
+
+pub use config_graph::{
+    AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef, CompanyConfig,
+    ConfigGraph, ConnectorConfig, ErpNextConnectorConfig, ForgejoConnectorConfig,
+    GitlabConnectorConfig, KnowledgeBaseConfig, MatrixConnectorConfig, O365ConnectorAuth,
+    O365ConnectorConfig, PennylaneConnectorConfig, SmtpConnectorConfig, SmtpTlsMode,
+    SparqlTemplateConfig, StalwartConnectorConfig, VectorStoreColumnType,
+    VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig, all_connector_kinds,
+};
+// Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
+// `ConfigStoreError`-returning functions below already spell `Result<T, ConfigStoreError>` with
+// two type parameters, and bringing `error::Result<T>` (one type parameter) into scope here
+// would shadow `std::result::Result` for the rest of this file, breaking every one of them. The
+// ported engine (`config_graph` module) imports `crate::error::Result` itself instead.
+pub use error::ConfigGraphError;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use oxigraph::model::{GraphName, NamedNode, Quad, Term};
+use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
 use oxigraph::store::{StorageError, Store};
 
 /// The config store's location under the per-user OS data directory.
@@ -149,6 +172,22 @@ pub enum ConfigStoreError {
          set CONFIG_STORE_PATH explicitly to an absolute path"
     )]
     NoDataDir,
+
+    /// A `SELECT` handed to [`ConfigStore::select`] was not valid SPARQL -- distinct from a
+    /// query that parses and simply matches nothing (`Ok(vec![])`), per that method's own doc
+    /// comment.
+    #[error("SPARQL syntax error: {0}")]
+    SparqlSyntax(#[from] oxigraph::sparql::SparqlSyntaxError),
+
+    /// A `SELECT` handed to [`ConfigStore::select`] parsed but failed during evaluation.
+    #[error("SPARQL evaluation error: {0}")]
+    SparqlEvaluation(#[from] oxigraph::sparql::QueryEvaluationError),
+
+    /// The underlying Oxigraph store failed a write (e.g. [`ConfigStore::remove_quad`], or a
+    /// direct `ConfigStore::inner()` insert/remove) -- not related to `open`'s own [`Self::Open`]
+    /// path-resolution failure above.
+    #[error("store error: {0}")]
+    Storage(#[from] StorageError),
 }
 
 /// Configuration's own persistent Oxigraph store, wrapping an `Arc<Store>` so
@@ -177,9 +216,84 @@ impl ConfigStore {
         })
     }
 
+    /// Wrap an already-open Oxigraph store, sharing its handle rather than opening a second
+    /// physical store at the same path (which the on-disk backend cannot safely do twice from
+    /// one process).
+    ///
+    /// This exists for `contreforts-kg`'s re-export shim (contreforts/contreforts-workspace#58,
+    /// D3c): before the config store's own physical location takes effect (D4 onward), that
+    /// shim's `ConfigGraph` adapter must keep operating on the exact store
+    /// `contreforts_kg::GraphStore` already has open -- today, one Oxigraph store holds both the
+    /// config graph and the knowledge graph for a user, so a *second*, independently-opened
+    /// store at the same path would not see the same data (and would likely fail outright on
+    /// the on-disk backend's own locking). Not one of the three primitives measured against the
+    /// ported engine's own needs (comment 7904: `select`, `inner`, `remove_quad`) -- this is a
+    /// distinct, later necessity for bridging the two crates' store types during the interim
+    /// before D4 separates them physically. D8 removes this constructor's only caller along with
+    /// the rest of the shim.
+    pub fn from_arc(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+
     /// Borrow the underlying Oxigraph store.
     pub fn inner(&self) -> &Store {
         &self.store
+    }
+
+    /// Execute a SPARQL `SELECT` query, returning solutions as `(variable name, value)` rows.
+    ///
+    /// Modeled on `crates/contreforts-kg/src/query.rs`'s `QueryEngine::select` -- the one of its
+    /// two methods the ported config-graph engine actually calls (7 sites; `ask` is never used,
+    /// contreforts-workspace#58 comment 7904). A query that parses and legitimately matches
+    /// nothing returns `Ok(vec![])`, never an error -- `fetch_connector`'s "no such connector yet"
+    /// path depends on being able to tell that apart from a malformed query, which is `Err`.
+    pub fn select(&self, sparql: &str) -> Result<Vec<Vec<(String, String)>>, ConfigStoreError> {
+        let prepared = SparqlEvaluator::new().parse_query(sparql)?;
+        match prepared.on_store(&self.store).execute()? {
+            QueryResults::Solutions(solutions) => {
+                let mut rows = Vec::new();
+                for solution in solutions {
+                    let solution: QuerySolution = solution?;
+                    let mut row = Vec::new();
+                    for (var, term) in solution.iter() {
+                        let val = match term {
+                            Term::Literal(l) => l.value().to_string(),
+                            // Bare IRI, not `<...>`-wrapped Turtle-serialization syntax --
+                            // matching `QueryEngine::select`'s own behaviour (contreforts-kg#30).
+                            Term::NamedNode(n) => n.as_str().to_string(),
+                            _ => term.to_string(),
+                        };
+                        row.push((var.as_str().to_string(), val));
+                    }
+                    rows.push(row);
+                }
+                Ok(rows)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Remove exactly one quad (subject, predicate, object, named graph) -- not the whole
+    /// subject, and not a sibling predicate on the same subject.
+    ///
+    /// Modeled on `crates/contreforts-kg/src/store.rs`'s `GraphStore::remove_quad`, the one of
+    /// its several helpers the ported engine actually calls (4 sites; every other write already
+    /// goes through [`Self::inner`] directly, contreforts-workspace#58 comment 7904). Removing an
+    /// absent quad is a no-op, not an error.
+    pub fn remove_quad(
+        &self,
+        subject: &NamedNode,
+        predicate: &NamedNode,
+        object: &Term,
+        graph: &NamedNode,
+    ) -> Result<(), ConfigStoreError> {
+        self.store.remove(&Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+            GraphName::NamedNode(graph.clone()),
+        ))?;
+        Ok(())
     }
 }
 

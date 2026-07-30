@@ -17,6 +17,22 @@ thiserror = { workspace = true }
 # GraphConfig::from_env already uses (crates/contreforts-core/src/config.rs) --
 # same precedence, different leaf directory so the two stores never collide.
 dirs = { workspace = true }
+# contreforts/contreforts-workspace#58 (comment 7904), item D3c: the ported
+# engine's `ConnectorConfig` structs are (de)serializable, exactly as they are
+# in `contreforts-kg::config_graph` today -- config-api's JSON API is what
+# they exist for.
+serde = { workspace = true }
+# The engine's own vocabulary (`CONFIG_GRAPH`, `CORE_NS`, `company_iri`,
+# `connector_iri`, ...) lives here since D3b (contreforts/contreforts-workspace#58,
+# comment 7833) -- neither store crate depends on the other for it.
+contreforts-core = { workspace = true }
+# contreforts/contreforts-workspace#58 (comment 7791), item D3a: server-side
+# SHACL validation of connector writes lives below both store crates. Not
+# `{ workspace = true }`: this crate is not in the root workspace's
+# `[workspace.dependencies]` table (see its own manifest's comment on why it
+# must stand on its own even outside this superproject) -- same explicit-path
+# shape `contreforts-kg`'s own manifest already uses for this dependency.
+contreforts-declaration = { path = "../contreforts-core/declaration" }
 
 [dev-dependencies]
 # Isolated per-test temp directories: the store-open and datadir tests need
@@ -25,3 +41,8 @@ dirs = { workspace = true }
 # and self-cleaning. Same pin shape as contreforts-code's own dev-dependency
 # on this crate.
 tempfile = "3"
+# `admin_url_is_write_only`-style regression: the DDL credential must not
+# survive serialization, which is a stronger guarantee than checking the
+# struct field alone. Dev-only -- no production code in this crate serializes
+# to JSON itself.
+serde_json = { workspace = true }
