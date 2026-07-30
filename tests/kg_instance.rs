@@ -14,7 +14,7 @@
 //! This file is the configuration side only: the record's own persistence, CRUD and stability
 //! across a store reopen.
 
-use contreforts_config::{ConfigGraph, ConfigStore, KgInstanceConfig};
+use contreforts_config::{ConfigGraph, ConfigGraphError, ConfigStore, KgInstanceConfig};
 use contreforts_declaration::ConnectorDeclarations;
 
 fn store() -> (tempfile::TempDir, ConfigStore) {
@@ -147,5 +147,121 @@ fn prefix_survives_store_close_and_reopen() {
         found.iri_prefix, assigned_prefix,
         "a KG instance's assigned prefix must survive a store close/reopen -- otherwise every \
          subject IRI it ever wrote becomes permanently unreachable under its own prefix"
+    );
+}
+
+/// contreforts-workspace#58 D4, ruling 1: two instances must never share a **label** -- a1's
+/// tests only ever construct colliding labels as bare values, never through the store, so
+/// resolving "the instance named X" (contreforts-workspace#18 Q5) would otherwise silently pick
+/// one of two same-labelled instances. `set_kg_instance` must reject this, naming which
+/// constraint was violated and which existing instance (by its already-registered prefix) it
+/// collided with.
+#[test]
+fn a_second_instance_under_an_already_used_label_is_rejected() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let first_prefix = "https://contreforts.ds-labs.org/data/instance/first-aaa/".to_string();
+    cg.set_kg_instance(&KgInstanceConfig {
+        label: "shared-label".to_string(),
+        iri_prefix: first_prefix.clone(),
+    })
+    .expect("registering the first instance succeeds");
+
+    let err = cg
+        .set_kg_instance(&KgInstanceConfig {
+            label: "shared-label".to_string(),
+            iri_prefix: "https://contreforts.ds-labs.org/data/instance/second-bbb/".to_string(),
+        })
+        .expect_err(
+            "a second instance must not silently reuse a label already registered to a \
+             different (differently-prefixed) instance",
+        );
+
+    match err {
+        ConfigGraphError::KgInstanceLabelConflict {
+            label,
+            existing_prefix,
+        } => {
+            assert_eq!(
+                label, "shared-label",
+                "the error must name the colliding label"
+            );
+            assert_eq!(
+                existing_prefix, first_prefix,
+                "the error must name the existing instance it collided with, by its \
+                 already-registered prefix"
+            );
+        }
+        other => panic!(
+            "expected ConfigGraphError::KgInstanceLabelConflict naming the label collision, \
+             got {other:?}"
+        ),
+    }
+
+    // The first instance must be completely undisturbed by the rejected write.
+    let still_there = cg
+        .get_kg_instance("shared-label")
+        .expect("lookup succeeds")
+        .expect("the original instance must still be registered");
+    assert_eq!(
+        still_there.iri_prefix, first_prefix,
+        "a rejected write must not have overwritten the original instance's assigned prefix"
+    );
+}
+
+/// contreforts-workspace#58 D4, ruling 1: two instances must never share an **IRI prefix** --
+/// doing so silently merges two instances' entity data into one IRI space, invisible until the
+/// data is already wrong (the same class of defect as the consolidation-key mismatch found
+/// earlier in this epic). `set_kg_instance` must reject this even when the labels differ,
+/// naming which constraint was violated and which existing instance (by its label) it collided
+/// with.
+#[test]
+fn a_second_instance_with_an_already_used_prefix_is_rejected() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let shared_prefix = "https://contreforts.ds-labs.org/data/instance/shared-ccc/".to_string();
+    cg.set_kg_instance(&KgInstanceConfig {
+        label: "original".to_string(),
+        iri_prefix: shared_prefix.clone(),
+    })
+    .expect("registering the first instance succeeds");
+
+    let err = cg
+        .set_kg_instance(&KgInstanceConfig {
+            label: "impostor".to_string(),
+            iri_prefix: shared_prefix.clone(),
+        })
+        .expect_err(
+            "a second instance, under a different label, must not silently reuse a prefix \
+             already assigned to a different instance",
+        );
+
+    match err {
+        ConfigGraphError::KgInstancePrefixConflict {
+            prefix,
+            existing_label,
+        } => {
+            assert_eq!(
+                prefix, shared_prefix,
+                "the error must name the colliding prefix"
+            );
+            assert_eq!(
+                existing_label, "original",
+                "the error must name the existing instance it collided with, by its label"
+            );
+        }
+        other => panic!(
+            "expected ConfigGraphError::KgInstancePrefixConflict naming the prefix collision, \
+             got {other:?}"
+        ),
+    }
+
+    assert!(
+        cg.get_kg_instance("impostor")
+            .expect("lookup succeeds")
+            .is_none(),
+        "the rejected write must not have registered the colliding instance under its own label"
     );
 }

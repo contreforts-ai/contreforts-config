@@ -400,6 +400,23 @@ pub struct KnowledgeBaseConfig {
     pub vector_store_label: String,
 }
 
+/// Identity of one `contreforts-kg` data instance (contreforts/contreforts-workspace#58 D4;
+/// #18 Q2): a **label** plus an **independently-assigned IRI prefix** -- the prefix is never
+/// derived from the label, so renaming an instance (`ConfigGraph::rename_kg_instance`) never
+/// rewrites a single subject IRI that instance's entity data was built from. Global, not
+/// company-scoped (ruling 2 on contreforts-workspace#58): one instance holds many companies'
+/// data, so scoping it per-company would invert that containment.
+///
+/// Both `label` and `iri_prefix` are enforced unique across all registered instances by
+/// `ConfigGraph::set_kg_instance` (ruling 1 on contreforts-workspace#58) -- a shared label
+/// would make Q5's "resolve by label, with a default" ambiguous, and a shared prefix would
+/// silently merge two instances' entity data into one IRI space.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KgInstanceConfig {
+    pub label: String,
+    pub iri_prefix: String,
+}
+
 /// Reference to one of the existing channel connectors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChannelRef {
@@ -758,6 +775,20 @@ fn insert_in_named_graph(
         GraphName::NamedNode(graph.clone()),
     ))?;
     Ok(())
+}
+
+/// IRI for a KG instance's own definition record (contreforts-workspace#58 D4), scoped by its
+/// **label**. A plain, hand-entered config-graph IRI -- rooted at the fixed `DATA_NS`, like
+/// `namespaces::company_iri` and friends -- never one of the entity/instance-data IRIs an
+/// instance's own assigned prefix re-derives (comment 7936's table). Not exported: nothing
+/// outside this module needs a KG instance's own subject IRI, only the `iri_prefix` field its
+/// record carries (consumed by `contreforts_kg::namespaces::InstanceNamespace`).
+fn kg_instance_iri(label: &str) -> String {
+    format!(
+        "{}kg-instance/{}",
+        namespaces::DATA_NS,
+        urlencoding::encode(label)
+    )
 }
 
 fn remove_subject_from_named_graph(
@@ -2051,6 +2082,222 @@ impl<'a> ConfigGraph<'a> {
             &self.graph,
         )?;
         Ok(())
+    }
+
+    // ── KG Instance CRUD (contreforts-workspace#58 D4) ───────────────────────
+    //
+    // A KG instance record is *configuration* -- it names, and stores, the independently
+    // assigned IRI prefix a `contreforts-kg` data instance builds its entity IRIs from
+    // (`contreforts_kg::namespaces::InstanceNamespace`). Global, not company-scoped (ruling 2):
+    // one instance holds many companies' data. Its own subject IRI is a plain, hand-entered
+    // config-graph IRI (`{DATA_NS}kg-instance/{label}`) -- it is not, and must never become, one
+    // of the entity/instance-data IRIs re-prefixed by instance assignment (comment 7936's
+    // table); `tests/config_iri_invariance.rs` pins the five builders that must stay rooted at
+    // the fixed `DATA_NS`, and this record's own subject follows the same rule for the same
+    // reason: it is itself hand-entered, not re-derivable by a sync.
+
+    /// Register a new KG instance, or idempotently re-register the exact same
+    /// `(label, iri_prefix)` pair. Enforces uniqueness on **both** fields, independently
+    /// (contreforts-workspace#58 D4, ruling 1):
+    ///
+    /// - a different, already-registered instance must not share this `label` (ambiguous
+    ///   resolution by label, contreforts-workspace#18 Q5), rejected with
+    ///   [`ConfigGraphError::KgInstanceLabelConflict`];
+    /// - a different, already-registered instance must not share this `iri_prefix` (silently
+    ///   merges two instances' entity data into one IRI space), rejected with
+    ///   [`ConfigGraphError::KgInstancePrefixConflict`].
+    ///
+    /// Renaming an existing instance is a distinct, dedicated operation --
+    /// [`Self::rename_kg_instance`] -- not a second call to this method with a new label.
+    pub fn set_kg_instance(&self, config: &KgInstanceConfig) -> Result<()> {
+        if let Some(existing) = self.get_kg_instance(&config.label)?
+            && existing.iri_prefix != config.iri_prefix
+        {
+            return Err(ConfigGraphError::KgInstanceLabelConflict {
+                label: config.label.clone(),
+                existing_prefix: existing.iri_prefix,
+            });
+        }
+        if let Some(other_label) = self.label_using_prefix(&config.iri_prefix)?
+            && other_label != config.label
+        {
+            return Err(ConfigGraphError::KgInstancePrefixConflict {
+                prefix: config.iri_prefix.clone(),
+                existing_label: other_label,
+            });
+        }
+
+        let iri = kg_instance_iri(&config.label);
+        let node = self.node(&iri)?;
+        remove_subject_from_named_graph(self.store, &node, &self.graph)?;
+        self.write_type(&node, &format!("{CORE_NS}KgInstance"))?;
+        self.write_literal(&node, &format!("{CORE_NS}label"), &config.label, None)?;
+        self.write_literal(
+            &node,
+            &format!("{CORE_NS}iriPrefix"),
+            &config.iri_prefix,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a single KG instance by label, or `None` if not registered.
+    pub fn get_kg_instance(&self, label: &str) -> Result<Option<KgInstanceConfig>> {
+        let iri = kg_instance_iri(label);
+        let sparql = format!(
+            "SELECT ?prefix WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               <{iri}> a <{CORE_NS}KgInstance> ; <{CORE_NS}iriPrefix> ?prefix \
+             }} }}"
+        );
+        let rows = self.store.select(&sparql)?;
+        match rows.first() {
+            None => Ok(None),
+            Some(row) => Ok(Some(KgInstanceConfig {
+                label: label.to_string(),
+                iri_prefix: col(row, "prefix")
+                    .ok_or_else(|| ConfigGraphError::InvalidIri("missing iriPrefix".into()))?,
+            })),
+        }
+    }
+
+    /// Return every registered KG instance.
+    pub fn list_kg_instances(&self) -> Result<Vec<KgInstanceConfig>> {
+        let sparql = format!(
+            "SELECT ?label ?prefix WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               ?inst a <{CORE_NS}KgInstance> ; \
+                     <{CORE_NS}label> ?label ; \
+                     <{CORE_NS}iriPrefix> ?prefix \
+             }} }}"
+        );
+        self.store
+            .select(&sparql)?
+            .into_iter()
+            .map(|row| {
+                Ok(KgInstanceConfig {
+                    label: col(&row, "label")
+                        .ok_or_else(|| ConfigGraphError::InvalidIri("missing label".into()))?,
+                    iri_prefix: col(&row, "prefix")
+                        .ok_or_else(|| ConfigGraphError::InvalidIri("missing iriPrefix".into()))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Rename a registered KG instance: `new_label` resolves it from here on, while its
+    /// assigned prefix stays byte-identical (contreforts-workspace#18 Q2 -- this is the entire
+    /// reason the prefix is assigned independently of the label rather than derived from it).
+    /// Moves the record to a new subject IRI (`{DATA_NS}kg-instance/{new_label}`); the old
+    /// label no longer resolves anything afterward. Fails if `old_label` is not registered, or
+    /// if `new_label` already names a *different* instance.
+    pub fn rename_kg_instance(&self, old_label: &str, new_label: &str) -> Result<()> {
+        let existing = self.get_kg_instance(old_label)?.ok_or_else(|| {
+            ConfigGraphError::InvalidIri(format!(
+                "no KG instance registered under label '{old_label}'"
+            ))
+        })?;
+
+        if old_label != new_label
+            && let Some(collision) = self.get_kg_instance(new_label)?
+        {
+            return Err(ConfigGraphError::KgInstanceLabelConflict {
+                label: new_label.to_string(),
+                existing_prefix: collision.iri_prefix,
+            });
+        }
+
+        let old_node = self.node(&kg_instance_iri(old_label))?;
+        remove_subject_from_named_graph(self.store, &old_node, &self.graph)?;
+
+        let new_node = self.node(&kg_instance_iri(new_label))?;
+        self.write_type(&new_node, &format!("{CORE_NS}KgInstance"))?;
+        self.write_literal(&new_node, &format!("{CORE_NS}label"), new_label, None)?;
+        self.write_literal(
+            &new_node,
+            &format!("{CORE_NS}iriPrefix"),
+            &existing.iri_prefix,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// The label of the registered instance currently holding `prefix`, if any. Checked in
+    /// Rust over [`Self::list_kg_instances`] rather than embedding `prefix` as a SPARQL string
+    /// literal -- an assigned prefix is operator-supplied, and this sidesteps having to escape
+    /// it for safe embedding in a query.
+    fn label_using_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        Ok(self
+            .list_kg_instances()?
+            .into_iter()
+            .find(|instance| instance.iri_prefix == prefix)
+            .map(|instance| instance.label))
+    }
+
+    // ── Target-KB link (contreforts-workspace#58 D4) ─────────────────────────
+    //
+    // A connector's config names the knowledge base it feeds, one-directionally -- a connector
+    // names its target KB, a KB never names its connectors (contreforts-workspace#18 point 3).
+    // Stored as a **literal** label on the connector's own subject, not an IRI reference to the
+    // KB's node: contreforts-workspace#58 ruling 3 keeps this deliberately ambiguity-proof.
+    // #18's own text is unclear on which direction "config gains a Target-KB link" describes --
+    // the prose reads config -> KB, but the direction rule is written "KB graph -> config
+    // graph, never the reverse". A literal label satisfies both readings at once, because it
+    // creates *no RDF edge* across graphs in either direction: this predicate's object is a
+    // plain string that happens to match a `KnowledgeBaseConfig::label`, not a `NamedNode`
+    // pointing into KB data. D5 must settle this ambiguity definitively when it builds the
+    // write-time/startup guard -- a guard cannot enforce a direction the design has not fixed.
+
+    /// Set (or replace) the label of the knowledge base a connector targets. Does not validate
+    /// that `kb_label` names a KB that actually exists -- contreforts-workspace#58 D5's guard is
+    /// what enforces referential validity; D4 only establishes the link itself.
+    pub fn set_connector_target_kb(
+        &self,
+        company_slug: &str,
+        connector_kind: &str,
+        label: Option<&str>,
+        kb_label: &str,
+    ) -> Result<()> {
+        let conn_iri = namespaces::connector_iri(connector_kind, company_slug, label);
+        let conn_node = self.node(&conn_iri)?;
+        let pred_iri = format!("{CORE_NS}targetKnowledgeBase");
+        let pred_node = self.node(&pred_iri)?;
+
+        // Idempotent: drop any previously-set target before writing the new one, so re-linking
+        // a connector replaces rather than accumulates a second literal.
+        let quads: Vec<_> = self
+            .store
+            .inner()
+            .quads_for_pattern(
+                Some((&conn_node).into()),
+                Some((&pred_node).into()),
+                None,
+                Some((&self.graph).into()),
+            )
+            .collect::<std::result::Result<_, _>>()?;
+        for quad in quads {
+            self.store.inner().remove(&quad)?;
+        }
+
+        self.write_literal(&conn_node, &pred_iri, kb_label, None)
+    }
+
+    /// The label of the knowledge base a connector targets, or `None` if never linked.
+    pub fn get_connector_target_kb(
+        &self,
+        company_slug: &str,
+        connector_kind: &str,
+        label: Option<&str>,
+    ) -> Result<Option<String>> {
+        let conn_iri = namespaces::connector_iri(connector_kind, company_slug, label);
+        let sparql = format!(
+            "SELECT ?kb WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               <{conn_iri}> <{CORE_NS}targetKnowledgeBase> ?kb \
+             }} }}"
+        );
+        let rows = self.store.select(&sparql)?;
+        Ok(rows.first().and_then(|row| col(row, "kb")))
     }
 
     // ── Agent CRUD ────────────────────────────────────────────────────────────
