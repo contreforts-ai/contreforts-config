@@ -27,6 +27,22 @@
 //! dedicated arm for either variant (its `GraphError` catch-all still answers 500 for both) --
 //! that remaining gap is D8's to close when it wires an HTTP route to KG instance CRUD.
 //!
+//! D5/D6 (contreforts-workspace#58, comment 7969; #18 Q3 / #19 O2) deliberately raise **no new
+//! variants**: every one of its guard rejections -- a `KnowledgeBaseConfig` naming an
+//! unregistered or ambiguous `kg_instance_label`, a KB's `graph` falling outside its claimed
+//! instance's prefix, or a config record other than that KB's own `graph` storing its IRI
+//! verbatim -- is raised as [`InvalidIri`](ConfigGraphError::InvalidIri), the same variant
+//! `require_company` already reuses for "a required entity was not found" beyond literal IRI
+//! syntax. Adding a *named* variant per D5/D6 case (matching the D4 pair's own precedent) would
+//! break `contreforts-kg::config_graph`'s `impl From<ConfigGraphError> for GraphError` --
+//! documented on that `match` as deliberately exhaustive, never a wildcard catch-all -- which
+//! lives in a different repo this chain does not touch. Reusing `InvalidIri` keeps every one of
+//! these four new rejections a client-fault domain outcome (not folded into
+//! [`Store`](ConfigGraphError::Store), which is for propagated store failures only) without
+//! requiring a coordinated change across two repos for a case no route exercises yet (D8 still
+//! has to wire a consumer to any of these paths). Revisit this the next time
+//! `contreforts-kg`'s shim changes, rather than growing this enum unilaterally.
+//!
 //! [`Store`](ConfigGraphError::Store) is the fourth variant, and it is deliberately *not* one of
 //! "the three cases the engine raises": it carries an underlying [`ConfigStoreError`] (a SPARQL
 //! parse/evaluation failure from [`crate::ConfigStore::select`], or a storage failure from
@@ -88,6 +104,65 @@ pub enum ConfigGraphError {
         prefix: String,
         existing_label: String,
     },
+}
+
+/// D5/D6's guard rejections (contreforts-workspace#58, comment 7969), each raised as
+/// [`ConfigGraphError::InvalidIri`] rather than a dedicated variant -- see this module's top
+/// doc comment for why. Free functions (not methods) so both `ConfigGraph`'s write path and its
+/// `validate_startup` can build the identical message shape without duplicating the wording.
+impl ConfigGraphError {
+    /// `ConfigGraph::set_knowledge_base` refused a `KnowledgeBaseConfig` naming a
+    /// `kg_instance_label` that is not a registered `KgInstanceConfig` -- D5's guard has nothing
+    /// to check a dangling reference against.
+    pub(crate) fn kb_instance_unregistered(kb_label: &str, instance_label: &str) -> Self {
+        Self::InvalidIri(format!(
+            "knowledge base '{kb_label}' names KG instance '{instance_label}', which is not \
+             registered -- register it first with `ConfigGraph::set_kg_instance`"
+        ))
+    }
+
+    /// `ConfigGraph::set_knowledge_base` was given `kg_instance_label: None` while more than one
+    /// `KgInstanceConfig` is registered -- resolution is explicit, never a silent pick: with
+    /// exactly one registered instance `None` resolves to it, but with several, guessing would
+    /// reintroduce the exact "absence presenting as success" failure this epic keeps paying for.
+    pub(crate) fn kg_instance_ambiguous(kb_label: &str, instance_count: usize) -> Self {
+        Self::InvalidIri(format!(
+            "knowledge base '{kb_label}' does not name a KG instance, and {instance_count} are \
+             registered -- with more than one, resolution is ambiguous; name one explicitly via \
+             `kg_instance_label`"
+        ))
+    }
+
+    /// `ConfigGraph::set_knowledge_base` refused a `KnowledgeBaseConfig` whose `graph` does not
+    /// fall under its own claimed instance's registered IRI prefix -- D5's first invariant (#18
+    /// Q3, comment 7969): "its graph IRI does not fall under its own instance's assigned prefix"
+    /// is what "points into another instance's data" becomes once a KB names its instance. Names
+    /// the KB, the offending graph IRI, and the instance whose prefix it violated (the KB's own
+    /// *claimed* instance -- not whichever instance the graph happens to match instead, if any).
+    pub(crate) fn kb_graph_prefix_violation(
+        kb_label: &str,
+        graph: &str,
+        instance_label: &str,
+    ) -> Self {
+        Self::InvalidIri(format!(
+            "knowledge base '{kb_label}' claims KG instance '{instance_label}', but its graph \
+             '{graph}' does not fall under that instance's registered IRI prefix"
+        ))
+    }
+
+    /// A config write (a connector field, or the Target-KB link) tried to store, verbatim, a
+    /// value equal to a registered KB's own `graph` -- D5's second invariant (#18 Q3, comment
+    /// 7969): "exactly one config record may name a KB graph IRI -- the KB's own
+    /// `KnowledgeBaseConfig.graph` -- and no other config record may name one at all." Raised
+    /// wherever it is reached: `ConfigGraph::write_connector`'s generic engine (all eleven
+    /// connector kinds' fields) and `ConfigGraph::set_connector_target_kb` directly.
+    pub(crate) fn kb_graph_referenced_elsewhere(value: &str) -> Self {
+        Self::InvalidIri(format!(
+            "'{value}' is a registered knowledge base's own graph IRI -- only that KB's own \
+             `KnowledgeBaseConfig.graph` may hold this value; no other config record may \
+             reference it"
+        ))
+    }
 }
 
 impl From<oxigraph::store::StorageError> for ConfigGraphError {

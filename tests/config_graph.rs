@@ -290,6 +290,7 @@ fn knowledge_base_round_trip() {
     let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
     let kb = KnowledgeBaseConfig {
         label: "docs".into(),
+        kg_instance_label: None,
         graph: Some("http://example.org/code-graph".into()),
         vector_store_label: "primary".into(),
     };

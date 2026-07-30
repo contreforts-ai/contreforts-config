@@ -60,7 +60,7 @@ fn a_kb_belongs_to_its_registered_instance_and_the_association_round_trips() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some("https://contreforts.ds-labs.org/data/instance/p1/kb/support".to_string()),
             vector_store_label: "vs".to_string(),
         },
@@ -73,14 +73,16 @@ fn a_kb_belongs_to_its_registered_instance_and_the_association_round_trips() {
         .expect("the KB just registered is found");
 
     assert_eq!(
-        got.kg_instance_label, "primary",
+        got.kg_instance_label,
+        Some("primary".to_string()),
         "the instance association must round-trip exactly, not merely something truthy"
     );
 
     let listed = cg.list_knowledge_bases("acme").expect("listing succeeds");
     assert_eq!(listed.len(), 1);
     assert_eq!(
-        listed[0].kg_instance_label, "primary",
+        listed[0].kg_instance_label,
+        Some("primary".to_string()),
         "the instance association must also appear in the list view, not only the single-fetch \
          path -- a guard or a UI that reads only one of the two would silently miss the other"
     );
@@ -111,7 +113,7 @@ fn the_instance_association_survives_store_close_and_reopen() {
             "acme",
             &KnowledgeBaseConfig {
                 label: "support".to_string(),
-                kg_instance_label: "durable".to_string(),
+                kg_instance_label: Some("durable".to_string()),
                 graph: None,
                 vector_store_label: "vs".to_string(),
             },
@@ -127,7 +129,8 @@ fn the_instance_association_survives_store_close_and_reopen() {
         .expect("the KB registered before close is still there after reopen");
 
     assert_eq!(
-        found.kg_instance_label, "durable",
+        found.kg_instance_label,
+        Some("durable".to_string()),
         "the instance association must survive a store close/reopen -- otherwise every \
          KB's own definition would silently lose the fact this guard depends on"
     );
@@ -153,7 +156,7 @@ fn a_kb_naming_an_unregistered_instance_is_rejected() {
             "acme",
             &KnowledgeBaseConfig {
                 label: "orphan".to_string(),
-                kg_instance_label: "never-registered".to_string(),
+                kg_instance_label: Some("never-registered".to_string()),
                 graph: None,
                 vector_store_label: "vs".to_string(),
             },
@@ -178,5 +181,101 @@ fn a_kb_naming_an_unregistered_instance_is_rejected() {
             .expect("lookup succeeds")
             .is_none(),
         "the rejected write must not have registered the KB at all"
+    );
+}
+
+/// `kg_instance_label: None` resolution's third case (contreforts/contreforts-workspace#58's
+/// follow-up ruling 1, not covered by any of a1's own tests above): with more than one
+/// registered instance, `None` cannot resolve to "the sole one" -- there isn't one -- and
+/// silently picking either would reintroduce exactly the "absence presenting as success" failure
+/// this epic keeps paying for. Must be a named error, not a guess, naming the KB attempting the
+/// ambiguous write.
+#[test]
+fn a_kb_with_no_instance_named_and_multiple_instances_registered_is_rejected_as_ambiguous() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    register_instance(
+        &cg,
+        "primary",
+        "https://contreforts.ds-labs.org/data/instance/multi-p1/",
+    );
+    register_instance(
+        &cg,
+        "secondary",
+        "https://contreforts.ds-labs.org/data/instance/multi-p2/",
+    );
+    cg.add_company(&CompanyConfig {
+        slug: "acme".to_string(),
+        name: "Acme".to_string(),
+    })
+    .expect("company registers cleanly");
+
+    let err = cg
+        .set_knowledge_base(
+            "acme",
+            &KnowledgeBaseConfig {
+                label: "ambiguous".to_string(),
+                kg_instance_label: None,
+                graph: None,
+                vector_store_label: "vs".to_string(),
+            },
+        )
+        .expect_err(
+            "with more than one registered instance, `kg_instance_label: None` must be rejected \
+             rather than silently picking one",
+        );
+
+    let message = err.to_string();
+    assert!(
+        message.contains("ambiguous"),
+        "the error must name the KB attempting the ambiguous write, got: {message:?}"
+    );
+
+    assert!(
+        cg.get_knowledge_base("acme", "ambiguous")
+            .expect("lookup succeeds")
+            .is_none(),
+        "the rejected write must not have registered the KB at all"
+    );
+}
+
+/// `kg_instance_label: None` resolution's remaining case: with **zero** registered instances,
+/// there is nothing for a KB to belong to yet, and nothing for the prefix guard to check --
+/// treated as "no association recorded" rather than an error, so every caller that predates KG
+/// instances entirely (every `KnowledgeBaseConfig` stored before D4, and
+/// `contreforts-config-api`'s knowledge-base routes, which have never registered one) keeps
+/// working unchanged. Distinct from the multi-instance case above, which *is* an error: zero
+/// instances means the feature has not been adopted yet, not that a real ambiguity exists.
+#[test]
+fn a_kb_with_no_instance_named_and_no_instance_registered_is_accepted_with_no_association() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.add_company(&CompanyConfig {
+        slug: "acme".to_string(),
+        name: "Acme".to_string(),
+    })
+    .expect("company registers cleanly");
+
+    cg.set_knowledge_base(
+        "acme",
+        &KnowledgeBaseConfig {
+            label: "docs".to_string(),
+            kg_instance_label: None,
+            graph: Some("http://example.org/code-graph".to_string()),
+            vector_store_label: "vs".to_string(),
+        },
+    )
+    .expect(
+        "with zero registered instances, `kg_instance_label: None` must be accepted -- there is \
+         nothing registered for this KB to belong to, so the guard has nothing to check",
+    );
+
+    let got = cg
+        .get_knowledge_base("acme", "docs")
+        .expect("lookup succeeds")
+        .expect("the KB just registered is found");
+    assert_eq!(
+        got.kg_instance_label, None,
+        "no instance was registered to resolve to, so none must be recorded"
     );
 }

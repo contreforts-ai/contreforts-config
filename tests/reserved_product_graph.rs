@@ -162,11 +162,11 @@ fn the_same_guarded_primitive_still_writes_an_ordinary_graph() {
         );
 
     let rows = store
-        .select(&format!(
-            "SELECT ?o WHERE {{ GRAPH <https://contreforts.test/graph/not-reserved> {{ \
+        .select(
+            "SELECT ?o WHERE { GRAPH <https://contreforts.test/graph/not-reserved> { \
                <https://contreforts.test/subject/1> <https://contreforts.test/predicate/name> ?o \
-             }} }}"
-        ))
+             } }",
+        )
         .expect("select succeeds");
     assert_eq!(
         rows.len(),

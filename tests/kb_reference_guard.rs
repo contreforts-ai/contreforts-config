@@ -47,7 +47,7 @@ fn setup_company_and_kb(cg: &ConfigGraph<'_>) -> String {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some(kb_graph.clone()),
             vector_store_label: "vs".to_string(),
         },

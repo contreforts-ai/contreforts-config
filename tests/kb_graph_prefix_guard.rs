@@ -60,7 +60,7 @@ fn a_kb_graph_within_its_own_instance_prefix_is_accepted() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some(own_graph.clone()),
             vector_store_label: "vs".to_string(),
         },
@@ -92,7 +92,7 @@ fn a_kb_graph_under_a_different_registered_instances_prefix_is_rejected_at_write
             "acme",
             &KnowledgeBaseConfig {
                 label: "support".to_string(),
-                kg_instance_label: "primary".to_string(),
+                kg_instance_label: Some("primary".to_string()),
                 graph: Some(foreign_graph.clone()),
                 vector_store_label: "vs".to_string(),
             },
@@ -142,7 +142,7 @@ fn a_kb_graph_matching_no_registered_prefix_at_all_is_rejected() {
             "acme",
             &KnowledgeBaseConfig {
                 label: "support".to_string(),
-                kg_instance_label: "primary".to_string(),
+                kg_instance_label: Some("primary".to_string()),
                 graph: Some(stray_graph.clone()),
                 vector_store_label: "vs".to_string(),
             },
@@ -168,7 +168,7 @@ fn a_kb_with_no_graph_set_is_unaffected_by_the_prefix_guard() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: None,
             vector_store_label: "vs".to_string(),
         },

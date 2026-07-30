@@ -61,6 +61,7 @@ fn config_graph_iris_are_unaffected_by_instance_assignment() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
+            kg_instance_label: None,
             graph: None,
             vector_store_label: "vs".to_string(),
         },

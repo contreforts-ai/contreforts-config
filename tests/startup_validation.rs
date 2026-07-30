@@ -65,7 +65,7 @@ fn validate_startup_reports_no_violations_for_a_clean_store() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some(format!("{PRIMARY_PREFIX}entity/1")),
             vector_store_label: "vs".to_string(),
         },
@@ -106,7 +106,7 @@ fn validate_startup_catches_a_kb_graph_corrupted_via_the_raw_store() {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some(format!("{PRIMARY_PREFIX}entity/1")),
             vector_store_label: "vs".to_string(),
         },
@@ -186,7 +186,7 @@ fn validate_startup_catches_a_target_kb_link_corrupted_to_a_graph_iri_via_the_ra
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
-            kg_instance_label: "primary".to_string(),
+            kg_instance_label: Some("primary".to_string()),
             graph: Some(kb_graph.clone()),
             vector_store_label: "vs".to_string(),
         },
