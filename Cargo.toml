@@ -1,0 +1,27 @@
+[package]
+name = "contreforts-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Configuration's own Oxigraph store and datadir, separate from contreforts-kg"
+
+[dependencies]
+# The store itself -- contreforts-workspace#18's design gives configuration its
+# own Oxigraph runtime, independent of contreforts-kg's.
+oxigraph = { workspace = true }
+# Named error for an unusable store path (contreforts-workspace#58 D2) -- no
+# panic, no silent fallback to a temp or current directory.
+thiserror = { workspace = true }
+# Per-user OS data directory, mirroring the mechanism contreforts-core's
+# GraphConfig::from_env already uses (crates/contreforts-core/src/config.rs) --
+# same precedence, different leaf directory so the two stores never collide.
+dirs = { workspace = true }
+
+[dev-dependencies]
+# Isolated per-test temp directories: the store-open and datadir tests need
+# real filesystem paths (an in-memory store can't pin "own datadir" or
+# "unusable path" behaviour), and tempfile keeps each test's directory unique
+# and self-cleaning. Same pin shape as contreforts-code's own dev-dependency
+# on this crate.
+tempfile = "3"
