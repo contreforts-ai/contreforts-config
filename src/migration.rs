@@ -129,7 +129,10 @@ pub fn migrate_config_graph_if_needed(
         config_store_path = %config_store
             .path()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<unknown -- ConfigStore opened via from_arc>".to_string()),
+            // ConfigStore::open (this struct's only constructor since contreforts-workspace#58
+            // D8 part 2b deleted the from_arc bridge) always records a path -- this fallback is
+            // defensive, not reachable in practice.
+            .unwrap_or_else(|| "<unknown ConfigStore path>".to_string()),
         triples_copied,
         "config-graph migration: copied and verified {triples_copied} triple(s) from the \
          combined store at {} into the config store -- the combined store's own copy is left \
