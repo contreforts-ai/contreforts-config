@@ -18,6 +18,7 @@
 
 pub mod config_graph;
 pub mod error;
+pub mod migration;
 
 pub use config_graph::{
     AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef, CompanyConfig,
@@ -27,6 +28,7 @@ pub use config_graph::{
     SmtpTlsMode, SparqlTemplateConfig, StalwartConnectorConfig, VectorStoreColumnType,
     VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig, all_connector_kinds,
 };
+pub use migration::{MigrationOutcome, migrate_config_graph_if_needed, verify_config_graph_copy};
 // Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
 // `ConfigStoreError`-returning functions below already spell `Result<T, ConfigStoreError>` with
 // two type parameters, and bringing `error::Result<T>` (one type parameter) into scope here
@@ -227,6 +229,20 @@ pub enum ConfigStoreError {
     /// originates from that one call, never from an ordinary quad write.
     #[error("failed to load the reserved product graph: {0}")]
     ProductGraphLoad(#[from] LoaderError),
+
+    /// [`crate::verify_config_graph_copy`] found the config store's `CONFIG_GRAPH` copy
+    /// incomplete relative to the combined store's own `CONFIG_GRAPH` (contreforts-workspace#58,
+    /// D8 part 2a). Returned as a named error, never a warning and never a lower-count "success"
+    /// -- an incomplete copy of hand-entered, non-regenerable data must refuse to proceed.
+    /// Names both the source's total triple count and how many were actually found in the
+    /// config store, so an operator can see exactly how incomplete the copy was.
+    #[error(
+        "config graph copy verification failed: expected {expected} triple(s) from the \
+         combined store's CONFIG_GRAPH, found only {found} in the config store -- the copy is \
+         incomplete, so migration has not completed; the combined store's own CONFIG_GRAPH is \
+         left untouched, so a retry (or manual investigation) can start from a known-good source"
+    )]
+    ConfigGraphCopyIncomplete { expected: usize, found: usize },
 }
 
 /// Configuration's own persistent Oxigraph store, wrapping an `Arc<Store>` so
@@ -235,6 +251,12 @@ pub enum ConfigStoreError {
 #[derive(Clone)]
 pub struct ConfigStore {
     store: Arc<Store>,
+    /// The filesystem path this store was opened at, when known. `None` for stores wrapped via
+    /// [`Self::from_arc`], which receives an already-open handle with no path of its own to
+    /// record. Used only for diagnostic logging (`migration::migrate_config_graph_if_needed`
+    /// naming both the source and destination paths on the one path that genuinely needs to be
+    /// loud) -- nothing in this crate resolves behaviour from it.
+    path: Option<PathBuf>,
 }
 
 impl ConfigStore {
@@ -252,6 +274,7 @@ impl ConfigStore {
         })?;
         Ok(Self {
             store: Arc::new(store),
+            path: Some(path.to_path_buf()),
         })
     }
 
@@ -271,12 +294,18 @@ impl ConfigStore {
     /// before D4 separates them physically. D8 removes this constructor's only caller along with
     /// the rest of the shim.
     pub fn from_arc(store: Arc<Store>) -> Self {
-        Self { store }
+        Self { store, path: None }
     }
 
     /// Borrow the underlying Oxigraph store.
     pub fn inner(&self) -> &Store {
         &self.store
+    }
+
+    /// The filesystem path this store was opened at, if known — see the [`Self`] struct's own
+    /// doc comment on the `path` field for why a store wrapped via [`Self::from_arc`] has none.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Execute a SPARQL `SELECT` query, returning solutions as `(variable name, value)` rows.
