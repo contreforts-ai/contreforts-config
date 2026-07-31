@@ -251,11 +251,14 @@ pub enum ConfigStoreError {
 #[derive(Clone)]
 pub struct ConfigStore {
     store: Arc<Store>,
-    /// The filesystem path this store was opened at, when known. `None` for stores wrapped via
-    /// [`Self::from_arc`], which receives an already-open handle with no path of its own to
-    /// record. Used only for diagnostic logging (`migration::migrate_config_graph_if_needed`
-    /// naming both the source and destination paths on the one path that genuinely needs to be
-    /// loud) -- nothing in this crate resolves behaviour from it.
+    /// The filesystem path this store was opened at. Used only for diagnostic logging
+    /// (`migration::migrate_config_graph_if_needed` naming both the source and destination
+    /// paths on the one path that genuinely needs to be loud) -- nothing in this crate resolves
+    /// behaviour from it. Kept `Option` (always `Some` since contreforts-workspace#58 D8 part
+    /// 2b deleted this struct's only other constructor, `from_arc`, which had no path of its
+    /// own) rather than narrowed to a bare `PathBuf`: that would be a public API change outside
+    /// this chain's remit, and every caller already handles the `None` case (`unwrap_or_else`),
+    /// so there is nothing broken by leaving it as-is.
     path: Option<PathBuf>,
 }
 
@@ -278,32 +281,23 @@ impl ConfigStore {
         })
     }
 
-    /// Wrap an already-open Oxigraph store, sharing its handle rather than opening a second
-    /// physical store at the same path (which the on-disk backend cannot safely do twice from
-    /// one process).
-    ///
-    /// This exists for `contreforts-kg`'s re-export shim (contreforts/contreforts-workspace#58,
-    /// D3c): before the config store's own physical location takes effect (D4 onward), that
-    /// shim's `ConfigGraph` adapter must keep operating on the exact store
-    /// `contreforts_kg::GraphStore` already has open -- today, one Oxigraph store holds both the
-    /// config graph and the knowledge graph for a user, so a *second*, independently-opened
-    /// store at the same path would not see the same data (and would likely fail outright on
-    /// the on-disk backend's own locking). Not one of the three primitives measured against the
-    /// ported engine's own needs (comment 7904: `select`, `inner`, `remove_quad`) -- this is a
-    /// distinct, later necessity for bridging the two crates' store types during the interim
-    /// before D4 separates them physically. D8 removes this constructor's only caller along with
-    /// the rest of the shim.
-    pub fn from_arc(store: Arc<Store>) -> Self {
-        Self { store, path: None }
-    }
-
     /// Borrow the underlying Oxigraph store.
     pub fn inner(&self) -> &Store {
         &self.store
     }
 
-    /// The filesystem path this store was opened at, if known — see the [`Self`] struct's own
-    /// doc comment on the `path` field for why a store wrapped via [`Self::from_arc`] has none.
+    /// The filesystem path this store was opened at.
+    ///
+    /// contreforts-workspace#58 D8 part 2b: this struct used to have a second constructor,
+    /// `from_arc`, that wrapped an already-open `Arc<Store>` with no path of its own -- a bridge
+    /// for `contreforts-kg`'s `config_graph` re-export shim, back when one physical Oxigraph
+    /// store held both a user's config graph and knowledge graph. That shim (and its only
+    /// caller of `from_arc`, `contreforts-config-api/src/routes/graph.rs`'s `list_kg_instances`
+    /// helper) is deleted now that every `ConfigGraph` consumer resolves its instance from this
+    /// crate directly -- `from_arc` is deleted with it, per comment 7791's ruling 2 ("if it
+    /// outlives D8, that is a defect, not a design"). [`Self::open`] is this struct's only
+    /// constructor now, so this always returns `Some` in practice -- still `Option<&Path>`
+    /// rather than narrowed to `&Path`, since that would be an unrelated public API change.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
