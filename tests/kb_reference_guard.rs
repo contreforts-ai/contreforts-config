@@ -37,7 +37,7 @@ fn setup_company_and_kb(cg: &ConfigGraph<'_>) -> String {
         iri_prefix: PREFIX.to_string(),
         // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated to
         // the KB-reference guard this file pins.
-        datadir: "/var/lib/contreforts/kg-instances/refguard-primary".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/refguard-primary".to_string()),
     })
     .expect("registering the instance succeeds");
     cg.add_company(&CompanyConfig {

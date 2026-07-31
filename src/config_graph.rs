@@ -435,10 +435,45 @@ pub struct KnowledgeBaseConfig {
 /// `ConfigGraph::set_kg_instance` (ruling 1 on contreforts-workspace#58) -- a shared label
 /// would make Q5's "resolve by label, with a default" ambiguous, and a shared prefix would
 /// silently merge two instances' entity data into one IRI space.
+///
+/// `datadir` (contreforts-workspace#58 D8, part 1) is where `GraphStore::open_for_instance`
+/// (`contreforts-kg`) actually opens this instance's on-disk store -- also enforced unique by
+/// `set_kg_instance`, since two instances sharing a datadir would interleave their writes into
+/// one physical store, silently corrupting both.
+///
+/// `Option`, not required, and deliberately so: a strict join on this field in
+/// `list_kg_instances`/`get_kg_instance` would make any instance record written before this
+/// field existed silently vanish from every listing -- exactly the "absence presenting as
+/// success" failure this epic keeps paying for, and in this case one with a security
+/// consequence, since D7's SPARQL update guard depends on `list_kg_instances` to know which
+/// graphs are protected. So every registered instance is always returned, `datadir` included or
+/// not; `None` is never fabricated into some default path (that would be the `./config_store`
+/// silent fallback D2 removed, one layer up) -- `contreforts_kg::GraphStore::open_for_instance`
+/// refuses outright, with a named error, when asked to open an instance whose `datadir` is
+/// `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KgInstanceConfig {
     pub label: String,
     pub iri_prefix: String,
+    pub datadir: Option<String>,
+}
+
+/// Outcome of [`ConfigGraph::lookup_kg_instance`], the shared three-way branching
+/// (contreforts-workspace#58 D8, part 1; #18 Q5) behind both
+/// [`ConfigGraph::resolve_kg_instance_label`] and [`ConfigGraph::discover_kg_instance`]. Kept
+/// deliberately private and un-annotated with any caller's own wording -- see
+/// `lookup_kg_instance`'s own doc comment for why each caller decides its own error text and its
+/// own zero-registered-instances behaviour on top of this.
+enum InstanceLookup {
+    /// A label resolved to a registered instance (whether given explicitly, or the sole instance
+    /// registered when none was given).
+    Found(KgInstanceConfig),
+    /// A given label named no registered instance.
+    NotRegistered,
+    /// No label was given, and zero instances are registered.
+    NoneRegistered,
+    /// No label was given, and more than one instance is registered; carries the count.
+    Ambiguous(usize),
 }
 
 /// Reference to one of the existing channel connectors.
@@ -2015,31 +2050,90 @@ impl<'a> ConfigGraph<'a> {
             .collect()
     }
 
+    // ── KG instance resolution (contreforts-workspace#58 D5 / D8 part 1; #18 Q5) ──
+    //
+    // The three-way branching below -- a named label resolves or errors; no label with exactly
+    // one registered instance resolves to it; no label with more than one is a named ambiguity
+    // error -- is shared by two callers that must never drift apart from each other:
+    // `resolve_kg_instance_label` (a `KnowledgeBaseConfig` write, which tolerates zero
+    // registered instances as "no association yet", because it is only recording a link) and
+    // `discover_kg_instance` (a consumer asking for an instance to actually open a store, which
+    // has no use for "no instance" -- none existing is a real failure there, not an empty
+    // success). Factored into one private helper, [`Self::lookup_kg_instance`], so the rule
+    // lives in exactly one place; each caller supplies only its own error wording and its own
+    // zero-registered-instances behaviour on top.
+
+    /// Shared resolution match (see the section comment above): resolves an optional KG instance
+    /// label against every currently registered instance. Callers translate
+    /// [`InstanceLookup::NotRegistered`] and [`InstanceLookup::Ambiguous`] into their own named
+    /// errors, and decide for themselves what to do with [`InstanceLookup::NoneRegistered`].
+    fn lookup_kg_instance(&self, label: Option<&str>) -> Result<InstanceLookup> {
+        match label {
+            Some(label) => match self.get_kg_instance(label)? {
+                Some(instance) => Ok(InstanceLookup::Found(instance)),
+                None => Ok(InstanceLookup::NotRegistered),
+            },
+            None => {
+                let mut instances = self.list_kg_instances()?;
+                match instances.len() {
+                    0 => Ok(InstanceLookup::NoneRegistered),
+                    1 => Ok(InstanceLookup::Found(instances.remove(0))),
+                    n => Ok(InstanceLookup::Ambiguous(n)),
+                }
+            }
+        }
+    }
+
     // ── KnowledgeBase CRUD ────────────────────────────────────────────────────
 
     /// Resolve `kg_instance_label` to a concrete, registered instance label, or `None` when no
     /// instance is registered at all (contreforts-workspace#58 D5; see the field's own doc
     /// comment on [`KnowledgeBaseConfig::kg_instance_label`] for the full three-way rule).
-    /// `kb_label` is only used to name the offending KB in an error.
+    /// `kb_label` is only used to name the offending KB in an error. Shares its branching with
+    /// [`Self::discover_kg_instance`] via [`Self::lookup_kg_instance`] -- see the section comment
+    /// above this method.
     fn resolve_kg_instance_label(
         &self,
         kb_label: &str,
         kg_instance_label: &Option<String>,
     ) -> Result<Option<String>> {
-        match kg_instance_label {
-            Some(label) => {
-                if self.get_kg_instance(label)?.is_none() {
-                    return Err(ConfigGraphError::kb_instance_unregistered(kb_label, label));
-                }
-                Ok(Some(label.clone()))
+        match self.lookup_kg_instance(kg_instance_label.as_deref())? {
+            InstanceLookup::Found(instance) => Ok(Some(instance.label)),
+            InstanceLookup::NotRegistered => Err(ConfigGraphError::kb_instance_unregistered(
+                kb_label,
+                kg_instance_label
+                    .as_deref()
+                    .expect("NotRegistered is only returned by lookup_kg_instance for Some(label)"),
+            )),
+            InstanceLookup::NoneRegistered => Ok(None),
+            InstanceLookup::Ambiguous(n) => {
+                Err(ConfigGraphError::kg_instance_ambiguous(kb_label, n))
             }
-            None => {
-                let instances = self.list_kg_instances()?;
-                match instances.len() {
-                    0 => Ok(None),
-                    1 => Ok(Some(instances[0].label.clone())),
-                    n => Err(ConfigGraphError::kg_instance_ambiguous(kb_label, n)),
-                }
+        }
+    }
+
+    /// Resolve which registered `contreforts-kg` data instance a consumer should open
+    /// (contreforts-workspace#58 D8, part 1; #18 Q5: "consumers resolve an instance from config
+    /// by label, with a default for single-instance deployments"). Shares its three-way
+    /// branching with [`Self::resolve_kg_instance_label`] via [`Self::lookup_kg_instance`] -- see
+    /// the section comment above -- but diverges on the zero-registered-instances case: this is
+    /// a consumer asking for an instance *to use*, so with nothing registered at all there is
+    /// nothing useful to return, and this returns a named error rather than the `Ok(None)` a
+    /// `KnowledgeBaseConfig` write can afford (ruling 1 on contreforts-workspace#58's D8 part 1
+    /// task).
+    pub fn discover_kg_instance(&self, label: Option<&str>) -> Result<KgInstanceConfig> {
+        match self.lookup_kg_instance(label)? {
+            InstanceLookup::Found(instance) => Ok(instance),
+            InstanceLookup::NotRegistered => Err(
+                ConfigGraphError::kg_instance_discovery_unregistered(label.expect(
+                    "NotRegistered is only returned by lookup_kg_instance for Some(label)",
+                )),
+            ),
+            InstanceLookup::NoneRegistered => {
+                Err(ConfigGraphError::kg_instance_discovery_none_registered())
+            }
+            InstanceLookup::Ambiguous(n) => {
+                Err(ConfigGraphError::kg_instance_discovery_ambiguous(n))
             }
         }
     }
@@ -2205,6 +2299,13 @@ impl<'a> ConfigGraph<'a> {
     ///
     /// Renaming an existing instance is a distinct, dedicated operation --
     /// [`Self::rename_kg_instance`] -- not a second call to this method with a new label.
+    ///
+    /// A third uniqueness check (contreforts-workspace#58 D8, part 1) applies whenever
+    /// `config.datadir` is `Some(..)`: a different, already-registered instance must not already
+    /// claim that same datadir, rejected with [`ConfigGraphError::KgInstanceDatadirConflict`] --
+    /// two instances sharing a datadir would interleave their writes into one physical Oxigraph
+    /// store, corrupting both silently. An instance registered with `datadir: None` claims
+    /// nothing and so can never collide on this check.
     pub fn set_kg_instance(&self, config: &KgInstanceConfig) -> Result<()> {
         if let Some(existing) = self.get_kg_instance(&config.label)?
             && existing.iri_prefix != config.iri_prefix
@@ -2222,6 +2323,15 @@ impl<'a> ConfigGraph<'a> {
                 existing_label: other_label,
             });
         }
+        if let Some(datadir) = &config.datadir
+            && let Some(other_label) = self.label_using_datadir(datadir)?
+            && other_label != config.label
+        {
+            return Err(ConfigGraphError::KgInstanceDatadirConflict {
+                datadir: datadir.clone(),
+                existing_label: other_label,
+            });
+        }
 
         let iri = kg_instance_iri(&config.label);
         let node = self.node(&iri)?;
@@ -2234,16 +2344,24 @@ impl<'a> ConfigGraph<'a> {
             &config.iri_prefix,
             None,
         )?;
+        if let Some(datadir) = &config.datadir {
+            self.write_literal(&node, &format!("{CORE_NS}datadir"), datadir, None)?;
+        }
         Ok(())
     }
 
     /// Fetch a single KG instance by label, or `None` if not registered.
+    ///
+    /// `datadir` is read with `OPTIONAL` (contreforts-workspace#58 D8, part 1) rather than a
+    /// plain join -- see [`KgInstanceConfig::datadir`]'s own doc comment for why a strict join
+    /// here would silently make any instance predating the field invisible.
     pub fn get_kg_instance(&self, label: &str) -> Result<Option<KgInstanceConfig>> {
         let iri = kg_instance_iri(label);
         let sparql = format!(
-            "SELECT ?prefix WHERE {{ \
+            "SELECT ?prefix ?datadir WHERE {{ \
              GRAPH <{CONFIG_GRAPH}> {{ \
-               <{iri}> a <{CORE_NS}KgInstance> ; <{CORE_NS}iriPrefix> ?prefix \
+               <{iri}> a <{CORE_NS}KgInstance> ; <{CORE_NS}iriPrefix> ?prefix . \
+               OPTIONAL {{ <{iri}> <{CORE_NS}datadir> ?datadir }} \
              }} }}"
         );
         let rows = self.store.select(&sparql)?;
@@ -2253,18 +2371,27 @@ impl<'a> ConfigGraph<'a> {
                 label: label.to_string(),
                 iri_prefix: col(row, "prefix")
                     .ok_or_else(|| ConfigGraphError::InvalidIri("missing iriPrefix".into()))?,
+                datadir: col(row, "datadir"),
             })),
         }
     }
 
     /// Return every registered KG instance.
+    ///
+    /// `datadir` is read with `OPTIONAL` (contreforts-workspace#58 D8, part 1), exactly as
+    /// [`Self::get_kg_instance`] does, and for the same reason -- every registered instance must
+    /// come back here whether or not it carries a datadir. `contreforts-config-api`'s D7 SPARQL
+    /// update guard resolves which graphs are protected by calling this method; a strict join
+    /// that dropped datadir-less instances from the result would silently disarm that guard for
+    /// them, an empty list standing in for what should be an error.
     pub fn list_kg_instances(&self) -> Result<Vec<KgInstanceConfig>> {
         let sparql = format!(
-            "SELECT ?label ?prefix WHERE {{ \
+            "SELECT ?label ?prefix ?datadir WHERE {{ \
              GRAPH <{CONFIG_GRAPH}> {{ \
                ?inst a <{CORE_NS}KgInstance> ; \
                      <{CORE_NS}label> ?label ; \
-                     <{CORE_NS}iriPrefix> ?prefix \
+                     <{CORE_NS}iriPrefix> ?prefix . \
+               OPTIONAL {{ ?inst <{CORE_NS}datadir> ?datadir }} \
              }} }}"
         );
         self.store
@@ -2276,17 +2403,21 @@ impl<'a> ConfigGraph<'a> {
                         .ok_or_else(|| ConfigGraphError::InvalidIri("missing label".into()))?,
                     iri_prefix: col(&row, "prefix")
                         .ok_or_else(|| ConfigGraphError::InvalidIri("missing iriPrefix".into()))?,
+                    datadir: col(&row, "datadir"),
                 })
             })
             .collect()
     }
 
     /// Rename a registered KG instance: `new_label` resolves it from here on, while its
-    /// assigned prefix stays byte-identical (contreforts-workspace#18 Q2 -- this is the entire
-    /// reason the prefix is assigned independently of the label rather than derived from it).
-    /// Moves the record to a new subject IRI (`{DATA_NS}kg-instance/{new_label}`); the old
-    /// label no longer resolves anything afterward. Fails if `old_label` is not registered, or
-    /// if `new_label` already names a *different* instance.
+    /// assigned prefix -- and its datadir (contreforts-workspace#58 D8, part 1) -- stay
+    /// byte-identical (contreforts-workspace#18 Q2 -- this is the entire reason the prefix is
+    /// assigned independently of the label rather than derived from it; the same reasoning
+    /// applies to the datadir, which is what `GraphStore::open_for_instance` actually opens --
+    /// losing it on rename would silently orphan the instance's own on-disk store). Moves the
+    /// record to a new subject IRI (`{DATA_NS}kg-instance/{new_label}`); the old label no longer
+    /// resolves anything afterward. Fails if `old_label` is not registered, or if `new_label`
+    /// already names a *different* instance.
     pub fn rename_kg_instance(&self, old_label: &str, new_label: &str) -> Result<()> {
         let existing = self.get_kg_instance(old_label)?.ok_or_else(|| {
             ConfigGraphError::InvalidIri(format!(
@@ -2315,6 +2446,9 @@ impl<'a> ConfigGraph<'a> {
             &existing.iri_prefix,
             None,
         )?;
+        if let Some(datadir) = &existing.datadir {
+            self.write_literal(&new_node, &format!("{CORE_NS}datadir"), datadir, None)?;
+        }
         Ok(())
     }
 
@@ -2327,6 +2461,19 @@ impl<'a> ConfigGraph<'a> {
             .list_kg_instances()?
             .into_iter()
             .find(|instance| instance.iri_prefix == prefix)
+            .map(|instance| instance.label))
+    }
+
+    /// The label of the registered instance currently holding `datadir`, if any -- the
+    /// datadir-uniqueness counterpart to [`Self::label_using_prefix`] (contreforts-workspace#58
+    /// D8, part 1). Same reasoning: checked in Rust over [`Self::list_kg_instances`] rather than
+    /// embedded as a SPARQL string literal, since a datadir is operator-supplied. Instances with
+    /// `datadir: None` never match here -- an unset datadir claims nothing.
+    fn label_using_datadir(&self, datadir: &str) -> Result<Option<String>> {
+        Ok(self
+            .list_kg_instances()?
+            .into_iter()
+            .find(|instance| instance.datadir.as_deref() == Some(datadir))
             .map(|instance| instance.label))
     }
 

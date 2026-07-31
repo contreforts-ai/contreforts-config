@@ -43,7 +43,7 @@ fn datadir_round_trips_through_set_and_get() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "roundtrip".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/roundtrip-1a2b/".to_string(),
-        datadir: assigned_datadir.clone(),
+        datadir: Some(assigned_datadir.clone()),
     })
     .expect("a fresh instance registers cleanly");
 
@@ -53,7 +53,8 @@ fn datadir_round_trips_through_set_and_get() {
         .expect("the instance we just registered is found by its label");
 
     assert_eq!(
-        got.datadir, assigned_datadir,
+        got.datadir,
+        Some(assigned_datadir.clone()),
         "the instance's datadir must round-trip exactly through set_kg_instance/get_kg_instance"
     );
 
@@ -63,7 +64,8 @@ fn datadir_round_trips_through_set_and_get() {
         .find(|i| i.label == "roundtrip")
         .expect("the registered instance appears in the listing");
     assert_eq!(
-        listed.datadir, assigned_datadir,
+        listed.datadir,
+        Some(assigned_datadir),
         "the datadir must also round-trip through list_kg_instances, not only the single-fetch \
          path -- a caller that reads only one of the two would silently miss the other"
     );
@@ -86,7 +88,7 @@ fn datadir_survives_store_close_and_reopen() {
         cg.set_kg_instance(&KgInstanceConfig {
             label: "durable-datadir".to_string(),
             iri_prefix: "https://contreforts.ds-labs.org/data/instance/reopen-dd-1/".to_string(),
-            datadir: assigned_datadir.clone(),
+            datadir: Some(assigned_datadir.clone()),
         })
         .expect("registering the instance succeeds");
     } // `store` (and its Arc<Store>) is dropped here, closing the on-disk store.
@@ -99,7 +101,8 @@ fn datadir_survives_store_close_and_reopen() {
         .expect("the instance registered before close is still there after reopen");
 
     assert_eq!(
-        found.datadir, assigned_datadir,
+        found.datadir,
+        Some(assigned_datadir),
         "a KG instance's datadir must survive a store close/reopen -- otherwise, after every \
          restart, nothing on disk remembers where that instance's own knowledge-graph data lives"
     );
@@ -117,13 +120,13 @@ fn two_instances_get_distinct_datadirs() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "east".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/east-4f1/".to_string(),
-        datadir: "/var/lib/contreforts/kg-instances/east".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/east".to_string()),
     })
     .expect("registering the first instance succeeds");
     cg.set_kg_instance(&KgInstanceConfig {
         label: "west".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/west-8b2/".to_string(),
-        datadir: "/var/lib/contreforts/kg-instances/west".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/west".to_string()),
     })
     .expect("registering the second instance succeeds");
 
@@ -167,7 +170,7 @@ fn re_registering_the_exact_same_instance_including_datadir_is_idempotent() {
     let config = KgInstanceConfig {
         label: "steady".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/steady-2c3/".to_string(),
-        datadir: "/var/lib/contreforts/kg-instances/steady".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/steady".to_string()),
     };
 
     cg.set_kg_instance(&config)
@@ -203,7 +206,7 @@ fn renaming_an_instance_leaves_its_datadir_intact() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "before-rename".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/rename-dd-1/".to_string(),
-        datadir: assigned_datadir.clone(),
+        datadir: Some(assigned_datadir.clone()),
     })
     .expect("a fresh instance registers cleanly");
 
@@ -216,7 +219,8 @@ fn renaming_an_instance_leaves_its_datadir_intact() {
         .expect("the instance is found under its new label after the rename");
 
     assert_eq!(
-        after.datadir, assigned_datadir,
+        after.datadir,
+        Some(assigned_datadir),
         "renaming an instance must not change its datadir -- that is the one on-disk location \
          its knowledge-graph data actually lives at, and losing it on rename would silently \
          orphan the instance's own store"
@@ -242,7 +246,7 @@ fn a_second_instance_on_an_already_registered_datadir_is_rejected() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "claimant".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/claimant-9a1/".to_string(),
-        datadir: shared_datadir.clone(),
+        datadir: Some(shared_datadir.clone()),
     })
     .expect("registering the first instance succeeds");
 
@@ -250,7 +254,7 @@ fn a_second_instance_on_an_already_registered_datadir_is_rejected() {
         .set_kg_instance(&KgInstanceConfig {
             label: "squatter".to_string(),
             iri_prefix: "https://contreforts.ds-labs.org/data/instance/squatter-9a2/".to_string(),
-            datadir: shared_datadir.clone(),
+            datadir: Some(shared_datadir.clone()),
         })
         .expect_err(
             "a second instance, under a different label and a different prefix, must not \
@@ -280,7 +284,8 @@ fn a_second_instance_on_an_already_registered_datadir_is_rejected() {
         .expect("lookup succeeds")
         .expect("the original instance must still be registered");
     assert_eq!(
-        still_there.datadir, shared_datadir,
+        still_there.datadir,
+        Some(shared_datadir),
         "a rejected write must not have disturbed the original instance's own datadir"
     );
 }

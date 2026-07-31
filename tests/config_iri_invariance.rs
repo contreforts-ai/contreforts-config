@@ -42,7 +42,7 @@ fn config_graph_iris_are_unaffected_by_instance_assignment() {
         iri_prefix: alien_prefix.to_string(),
         // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated to
         // the IRI-family invariant this file pins.
-        datadir: "/var/lib/contreforts/kg-instances/decoy".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/decoy".to_string()),
     })
     .expect("registering an instance succeeds");
 

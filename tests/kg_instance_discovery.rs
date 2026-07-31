@@ -59,7 +59,7 @@ fn register(cg: &ConfigGraph<'_>, label: &str, prefix: &str, datadir: &str) {
     cg.set_kg_instance(&KgInstanceConfig {
         label: label.to_string(),
         iri_prefix: prefix.to_string(),
-        datadir: datadir.to_string(),
+        datadir: Some(datadir.to_string()),
     })
     .expect("registering the instance succeeds");
 }
@@ -90,7 +90,8 @@ fn a_named_label_resolves_to_the_registered_instance() {
 
     assert_eq!(resolved.label, "primary");
     assert_eq!(
-        resolved.datadir, "/var/lib/contreforts/kg-instances/discover-primary",
+        resolved.datadir,
+        Some("/var/lib/contreforts/kg-instances/discover-primary".to_string()),
         "discovery must hand back the exact registered instance, not merely confirm one exists"
     );
 }
@@ -139,7 +140,8 @@ fn no_label_with_exactly_one_registered_instance_resolves_to_it() {
 
     assert_eq!(resolved.label, "only");
     assert_eq!(
-        resolved.datadir, "/var/lib/contreforts/kg-instances/discover-only",
+        resolved.datadir,
+        Some("/var/lib/contreforts/kg-instances/discover-only".to_string()),
         "the default resolution must hand back the sole instance's real record, datadir included"
     );
 }

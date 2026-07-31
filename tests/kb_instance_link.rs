@@ -38,7 +38,7 @@ fn register_instance(cg: &ConfigGraph<'_>, label: &str, iri_prefix: &str) {
         // this helper (which never register two instances under the same label -- label
         // uniqueness is D4's own guard) get distinct datadirs for free, never colliding with
         // the new datadir-uniqueness guard pinned in tests/kg_instance_datadir.rs.
-        datadir: format!("/var/lib/contreforts/kg-instances/{label}"),
+        datadir: Some(format!("/var/lib/contreforts/kg-instances/{label}")),
     })
     .expect("registering the instance succeeds");
 }
