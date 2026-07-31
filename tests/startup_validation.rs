@@ -319,3 +319,123 @@ fn validate_startup_catches_an_agent_knowledge_base_label_corrupted_to_a_graph_i
          got: {combined:?}"
     );
 }
+
+// ── D8 part 2c, item 3 (contreforts-workspace#58, comment 8127, "carried forward rather than
+// fixed"): `validate_startup`'s unconditional exemption for a `None`-labelled KB ─────────────────
+//
+// `src/config_graph.rs`'s `validate_startup` skips a `KnowledgeBaseConfig` whose
+// `kg_instance_label` is `None` unconditionally, rather than re-deriving the skip from the
+// store's *current* instance count the way `resolve_kg_instance_label` does at write time. A KB
+// written while zero instances existed keeps `kg_instance_label: None` forever unless re-saved,
+// so if an instance is registered *afterwards*, "another instance's data" becomes a real,
+// checkable concept for that KB -- but this pass keeps exempting it anyway.
+//
+// The asymmetry to preserve, not collapse: at *write* time (`tests/kb_instance_link.rs`'s
+// `a_kb_with_no_instance_named_and_no_instance_registered_is_accepted_with_no_association`,
+// already pinned there, not duplicated here), `None` with zero instances registered is accepted
+// -- vacuously fine, there is nothing else for the KB to point into. It is specifically the
+// *startup* pass,
+// examining a store where instances now exist, that must stop treating that same `None` as
+// nothing to check. The two tests below are the fix and its control: the same KB, the only
+// difference is whether an instance was registered after it, in the exact word order the task
+// describes ("once instances exist, a `None`-labelled KB is no longer silently exempt").
+
+/// The control, first: a `None`-labelled KB, with zero instances ever registered, must stay
+/// exempt -- `validate_startup` reporting no violations here is *existing, correct* behaviour
+/// this file's other tests already rely on staying true. Without this control, a fix that simply
+/// flagged every `None`-labelled KB unconditionally would also pass the fix test below, for the
+/// wrong reason.
+#[test]
+fn a_none_labelled_kb_stays_exempt_at_startup_while_zero_instances_are_ever_registered() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.add_company(&CompanyConfig {
+        slug: "acme".to_string(),
+        name: "Acme".to_string(),
+    })
+    .expect("company registers cleanly");
+
+    cg.set_knowledge_base(
+        "acme",
+        &KnowledgeBaseConfig {
+            label: "legacy".to_string(),
+            kg_instance_label: None,
+            graph: Some("https://contreforts.example/pre-instance-adoption/entity/1".to_string()),
+            vector_store_label: "vs".to_string(),
+        },
+    )
+    .expect(
+        "write time: kg_instance_label: None with zero registered instances is accepted -- \
+         vacuously fine, there is nothing else for this KB to point into",
+    );
+
+    let result = cg.validate_startup();
+    assert!(
+        result.is_ok(),
+        "with zero instances ever registered, a None-labelled KB predating instance adoption \
+         must stay exempt at startup -- got: {result:?}"
+    );
+}
+
+/// The fix: the *same* KB as above, except an instance is registered *after* the KB was written
+/// (still without the KB ever being re-saved, so `kg_instance_label` is still `None` in the
+/// store). Once at least one instance exists, "another instance's data" is a real, checkable
+/// concept for this KB too -- `validate_startup` must no longer report a clean pass for it
+/// unconditionally. This is the exact case `src/config_graph.rs`'s own comment on the `None` arm
+/// names as unfixed: "if an instance is registered afterwards and this KB is never re-saved, it
+/// stays permanently exempt... even though 'another instance's data' is now a real, checkable
+/// concept."
+#[test]
+fn a_none_labelled_kb_is_no_longer_exempt_at_startup_once_an_instance_is_registered_afterward() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.add_company(&CompanyConfig {
+        slug: "acme".to_string(),
+        name: "Acme".to_string(),
+    })
+    .expect("company registers cleanly");
+
+    cg.set_knowledge_base(
+        "acme",
+        &KnowledgeBaseConfig {
+            label: "legacy".to_string(),
+            kg_instance_label: None,
+            graph: Some("https://contreforts.example/pre-instance-adoption/entity/1".to_string()),
+            vector_store_label: "vs".to_string(),
+        },
+    )
+    .expect("write time: still accepted, with zero instances registered at write time");
+
+    // An instance is registered *after* the KB was written; the KB itself is never re-saved, so
+    // its stored `kgInstanceLabel` triple is still absent (`kg_instance_label: None` on read).
+    cg.set_kg_instance(&KgInstanceConfig {
+        label: "primary".to_string(),
+        iri_prefix: "https://contreforts.ds-labs.org/data/instance/startup-none-exempt/"
+            .to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/startup-none-exempt".to_string()),
+    })
+    .expect("registering the instance after the fact succeeds");
+
+    // Sanity: the KB really is still stored with kg_instance_label: None -- otherwise this test
+    // would not be exercising the exemption at all.
+    let stored = cg
+        .get_knowledge_base("acme", "legacy")
+        .expect("lookup succeeds")
+        .expect("the KB is still there");
+    assert_eq!(
+        stored.kg_instance_label, None,
+        "sanity check: the KB must still be unassociated -- this test is about a KB that is \
+         never re-saved after an instance appears, not one that was updated"
+    );
+
+    let violations = cg.validate_startup().expect_err(
+        "once at least one instance is registered, a None-labelled KB with a graph set must no \
+         longer be silently exempt from startup validation -- got Ok(()), meaning the exemption \
+         is still unconditional",
+    );
+    let combined = violations.join("\n");
+    assert!(
+        combined.contains("legacy"),
+        "the report must name the offending KB, got: {combined:?}"
+    );
+}
