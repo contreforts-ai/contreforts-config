@@ -37,6 +37,12 @@ urlencoding = { workspace = true }
 # must stand on its own even outside this superproject) -- same explicit-path
 # shape `contreforts-kg`'s own manifest already uses for this dependency.
 contreforts-declaration = { path = "../contreforts-core/declaration" }
+# `migration::migrate_config_graph_if_needed` logs at `info` on the one path that genuinely
+# needs to be loud -- the real, one-time copy of hand-entered configuration out of the combined
+# store (contreforts-workspace#58, D8 part 2a) -- and stays silent on every no-op path. Same
+# crate every other logging call site in the workspace already uses (e.g.
+# `contreforts-kg/src/orchestrator.rs`).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Isolated per-test temp directories: the store-open and datadir tests need
