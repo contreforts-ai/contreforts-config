@@ -17,15 +17,18 @@
 //! `ConfigGraph::set_kg_instance` enforces uniqueness on both a KG instance's label and its
 //! assigned IRI prefix, each rejected by its own named variant naming which constraint was
 //! violated and which existing instance it collided with, rather than one generic
-//! "already exists" message. Both have an identity-preserving `GraphError` counterpart of the
-//! same name: `contreforts-kg`'s shim maps them one-to-one, the same rule as the three domain
-//! cases above, rather than folding them into `GraphError::Adapter` -- even though no route
-//! exercises `set_kg_instance` through that shim today, an identical-looking fold of
-//! `SparqlSyntax` into `Adapter` one chain ago turned a 400 into a 500 on a path no test
-//! asserted on, which is exactly the failure shape "nothing calls it yet" invites if repeated
-//! here. `contreforts-config-api/src/error.rs`'s `ApiError::status` does not yet have a
-//! dedicated arm for either variant (its `GraphError` catch-all still answers 500 for both) --
-//! that remaining gap is D8's to close when it wires an HTTP route to KG instance CRUD.
+//! "already exists" message. A third,
+//! [`KgInstanceDatadirConflict`](ConfigGraphError::KgInstanceDatadirConflict), was added by D8
+//! part 1 for the same reason, once `KgInstanceConfig` grew a `datadir` field also enforced
+//! unique. All three have an identity-preserving `GraphError` counterpart of the same name:
+//! `contreforts-kg`'s shim maps them one-to-one, the same rule as the three domain cases above,
+//! rather than folding them into `GraphError::Adapter` -- even though no route exercises
+//! `set_kg_instance` through that shim today, an identical-looking fold of `SparqlSyntax` into
+//! `Adapter` one chain ago turned a 400 into a 500 on a path no test asserted on, which is
+//! exactly the failure shape "nothing calls it yet" invites if repeated here.
+//! `contreforts-config-api/src/error.rs`'s `ApiError::status` does not yet have a dedicated arm
+//! for any of the three (its `GraphError` catch-all still answers 500 for all of them) -- that
+//! remaining gap is D8 part 2's to close when it wires an HTTP route to KG instance CRUD.
 //!
 //! D5/D6 (contreforts-workspace#58, comment 7969; #18 Q3 / #19 O2) deliberately raise **no new
 //! variants**: every one of its guard rejections -- a `KnowledgeBaseConfig` naming an
@@ -128,6 +131,19 @@ pub enum ConfigGraphError {
         prefix: String,
         existing_label: String,
     },
+
+    /// `ConfigGraph::set_kg_instance` refused to register a KG instance because its **datadir**
+    /// is already assigned to a different instance (a different label). Two instances sharing a
+    /// datadir would interleave their writes into one physical Oxigraph store, silently
+    /// corrupting both -- contreforts-workspace#58 D8, part 1.
+    #[error(
+        "KG instance datadir '{datadir}' is already assigned to instance '{existing_label}' -- \
+         instance datadirs must be unique"
+    )]
+    KgInstanceDatadirConflict {
+        datadir: String,
+        existing_label: String,
+    },
 }
 
 /// D5/D6's guard rejections (contreforts-workspace#58, comment 7969), each raised as
@@ -188,6 +204,41 @@ impl ConfigGraphError {
             "'{value}' is a registered knowledge base's own graph IRI -- only that KB's own \
              `KnowledgeBaseConfig.graph` may hold this value; no other config record may \
              reference it"
+        ))
+    }
+
+    /// `ConfigGraph::discover_kg_instance` was given `Some(label)` naming no registered instance
+    /// (contreforts-workspace#58 D8, part 1; #18 Q5). Unlike
+    /// [`Self::kb_instance_unregistered`]'s equivalent case, there is no KB in view to name --
+    /// a consumer resolving an instance to open a store simply has nothing to open.
+    pub(crate) fn kg_instance_discovery_unregistered(label: &str) -> Self {
+        Self::InvalidIri(format!(
+            "no KG instance is registered under label '{label}' -- register it first with \
+             `ConfigGraph::set_kg_instance`"
+        ))
+    }
+
+    /// `ConfigGraph::discover_kg_instance` was given `None` with **zero** instances registered.
+    /// Ruling 1 on contreforts-workspace#58 D8, part 1: unlike
+    /// `KnowledgeBaseConfig::kg_instance_label`'s own `None` case (which tolerates zero as "no
+    /// association yet", because it is only recording a link), discovery is asking for an
+    /// instance *to use* -- none existing is a real failure, not an empty success that would
+    /// leave a caller with no store to open and no error explaining why.
+    pub(crate) fn kg_instance_discovery_none_registered() -> Self {
+        Self::InvalidIri(
+            "no KG instance is registered at all -- register one first with \
+             `ConfigGraph::set_kg_instance` before discovering one to open"
+                .to_string(),
+        )
+    }
+
+    /// `ConfigGraph::discover_kg_instance` was given `None` while more than one instance is
+    /// registered -- resolution is explicit, never a silent pick, mirroring
+    /// [`Self::kg_instance_ambiguous`]'s reasoning restated for a consumer with no KB in view.
+    pub(crate) fn kg_instance_discovery_ambiguous(instance_count: usize) -> Self {
+        Self::InvalidIri(format!(
+            "no KG instance label was given, and {instance_count} are registered -- with more \
+             than one, resolution is ambiguous; name one explicitly"
         ))
     }
 }

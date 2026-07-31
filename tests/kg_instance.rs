@@ -36,6 +36,9 @@ fn renaming_an_instance_leaves_its_assigned_prefix_byte_identical() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "primary".to_string(),
         iri_prefix: assigned_prefix.clone(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated to
+        // this test's own prefix-stability claim.
+        datadir: Some("/var/lib/contreforts/kg-instances/rename-primary".to_string()),
     })
     .expect("a fresh instance registers cleanly");
 
@@ -85,11 +88,16 @@ fn two_instances_get_independently_assigned_prefixes() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "north".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/north-7a1/".to_string(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field. Two distinct
+        // instances' own datadir behaviour is pinned separately in
+        // tests/kg_instance_datadir.rs; this file's own claim is about prefixes only.
+        datadir: Some("/var/lib/contreforts/kg-instances/north".to_string()),
     })
     .expect("registering the first instance succeeds");
     cg.set_kg_instance(&KgInstanceConfig {
         label: "south".to_string(),
         iri_prefix: "https://contreforts.ds-labs.org/data/instance/south-9c4/".to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/south".to_string()),
     })
     .expect("registering the second instance succeeds");
 
@@ -132,6 +140,9 @@ fn prefix_survives_store_close_and_reopen() {
         cg.set_kg_instance(&KgInstanceConfig {
             label: "durable".to_string(),
             iri_prefix: assigned_prefix.clone(),
+            // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated
+            // to this test's own prefix-reopen claim.
+            datadir: Some("/var/lib/contreforts/kg-instances/durable".to_string()),
         })
         .expect("registering the instance succeeds");
     } // `store` (and its Arc<Store>) is dropped here, closing the on-disk store.
@@ -165,6 +176,12 @@ fn a_second_instance_under_an_already_used_label_is_rejected() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "shared-label".to_string(),
         iri_prefix: first_prefix.clone(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field. The two
+        // attempts below are given distinct datadirs on purpose, so this label-conflict
+        // rejection stays attributable to the label collision alone, independent of whatever
+        // order a2 checks label/prefix/datadir uniqueness in -- see
+        // tests/kg_instance_datadir.rs for the dedicated datadir-collision coverage.
+        datadir: Some("/var/lib/contreforts/kg-instances/shared-label-first".to_string()),
     })
     .expect("registering the first instance succeeds");
 
@@ -172,6 +189,7 @@ fn a_second_instance_under_an_already_used_label_is_rejected() {
         .set_kg_instance(&KgInstanceConfig {
             label: "shared-label".to_string(),
             iri_prefix: "https://contreforts.ds-labs.org/data/instance/second-bbb/".to_string(),
+            datadir: Some("/var/lib/contreforts/kg-instances/shared-label-second".to_string()),
         })
         .expect_err(
             "a second instance must not silently reuse a label already registered to a \
@@ -225,6 +243,11 @@ fn a_second_instance_with_an_already_used_prefix_is_rejected() {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "original".to_string(),
         iri_prefix: shared_prefix.clone(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field. Kept distinct
+        // between "original" and "impostor" below for the same reason given in the label-conflict
+        // test above -- this test's rejection must stay attributable to the prefix collision
+        // alone.
+        datadir: Some("/var/lib/contreforts/kg-instances/original".to_string()),
     })
     .expect("registering the first instance succeeds");
 
@@ -232,6 +255,7 @@ fn a_second_instance_with_an_already_used_prefix_is_rejected() {
         .set_kg_instance(&KgInstanceConfig {
             label: "impostor".to_string(),
             iri_prefix: shared_prefix.clone(),
+            datadir: Some("/var/lib/contreforts/kg-instances/impostor".to_string()),
         })
         .expect_err(
             "a second instance, under a different label, must not silently reuse a prefix \

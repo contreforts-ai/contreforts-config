@@ -38,11 +38,16 @@ fn setup(cg: &ConfigGraph<'_>) {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "primary".to_string(),
         iri_prefix: PRIMARY_PREFIX.to_string(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated to
+        // startup validation's own guard, distinct per instance for the same reason given in
+        // tests/kb_graph_prefix_guard.rs.
+        datadir: Some("/var/lib/contreforts/kg-instances/startup-primary".to_string()),
     })
     .expect("registering the primary instance succeeds");
     cg.set_kg_instance(&KgInstanceConfig {
         label: "other".to_string(),
         iri_prefix: OTHER_PREFIX.to_string(),
+        datadir: Some("/var/lib/contreforts/kg-instances/startup-other".to_string()),
     })
     .expect("registering the other instance succeeds");
     cg.add_company(&CompanyConfig {
