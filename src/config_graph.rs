@@ -2644,23 +2644,42 @@ impl<'a> ConfigGraph<'a> {
                     continue;
                 };
                 let Some(instance_label) = &kb.kg_instance_label else {
-                    // No association recorded -- nothing registered for this KB to belong to
-                    // (see `KnowledgeBaseConfig::kg_instance_label`'s doc comment on the
-                    // zero-registered-instances case); there is nothing to check this graph
-                    // against.
+                    // D8 part 2c (contreforts-workspace#58, comment 8127, "carried forward
+                    // rather than fixed"): this skip is now re-derived from the store's
+                    // *current* instance count, the same way `resolve_kg_instance_label` does
+                    // at write time -- not an unconditional per-KB exemption.
                     //
-                    // Flagged forward, not fixed here (D5/D6 review, contreforts-workspace#58):
-                    // this skip is unconditional per-KB, not re-derived from the store's *current*
-                    // instance count the way `resolve_kg_instance_label` does at write time. A KB
+                    // The asymmetry to preserve, not collapse: at *write* time, `None` with
+                    // zero instances registered stays accepted (`tests/kb_instance_link.rs`'s
+                    // `a_kb_with_no_instance_named_and_no_instance_registered_is_accepted_with_no_association`)
+                    // -- vacuously fine, there was nothing else for the KB to point into. A KB
                     // written while zero instances existed keeps `kg_instance_label: None`
-                    // forever unless it is written again -- so if an instance is registered
-                    // *afterwards* and this KB is never re-saved, it stays permanently exempt from
-                    // this check, even though "another instance's data" is now a real, checkable
-                    // concept. Not fixed now: doing so needs reconciliation semantics (what should
-                    // happen to a pre-existing, un-associated KB once instances exist) that D8/D9
-                    // own, not this pass -- and unconditionally flagging every legacy `None` KB the
-                    // moment any instance exists would be noisy for the common, expected
-                    // transitional shape rather than a real corruption.
+                    // forever unless it is written again, so that same reasoning still holds
+                    // here *while the store still has zero instances*: nothing to check this
+                    // graph against, stay exempt.
+                    //
+                    // But once at least one instance is registered -- even one registered
+                    // *after* this KB was written, with the KB never re-saved -- "another
+                    // instance's data" becomes a real, checkable concept for this KB too, and
+                    // silently exempting it forever is exactly the "unchecked reported as fine"
+                    // shape this epic's guards exist to close (the same shape `set_agent`'s own
+                    // missed-scope fix above closed for `Agent`). This KB's own instance
+                    // affiliation is unknown -- there is no claimed instance to check the graph
+                    // against, only the fact that one now could exist -- so this is reported as
+                    // its own violation rather than silently passed or guessed at.
+                    if instances.is_empty() {
+                        continue;
+                    }
+                    violations.push(format!(
+                        "knowledge base '{}' (company '{}') has graph '{graph}' but names no \
+                         KG instance, and {} KG instance(s) are now registered -- once at \
+                         least one instance exists, an unassociated graph can no longer be \
+                         verified against anything; re-save this knowledge base naming its KG \
+                         instance explicitly via `kg_instance_label`",
+                        kb.label,
+                        company.slug,
+                        instances.len()
+                    ));
                     continue;
                 };
                 match instances.iter().find(|i| &i.label == instance_label) {
