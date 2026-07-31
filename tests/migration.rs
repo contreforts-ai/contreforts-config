@@ -619,3 +619,94 @@ fn kg_data_in_the_combined_store_is_never_copied_into_the_config_store() {
          found one in another graph: {target_quads:?}"
     );
 }
+
+// ── Adversarial review item 1: count equality is not content equality ──────────────────────
+
+/// `verify_config_graph_copy`'s error names `expected`/`found` as bare counts, which -- read on
+/// its own -- looks like it might only ever compare lengths. It does not: it checks that every
+/// one of the source's quads is individually present in the target (set containment), so a
+/// same-*count* copy whose *content* differs must still be rejected. Constructed directly rather
+/// than trusted from the implementation reading correct: after a real, successful migration, one
+/// genuine triple is swapped out of the config store for one fabricated, unrelated triple under
+/// CONFIG_GRAPH -- so the target's total CONFIG_GRAPH triple count is identical to the source's,
+/// but its content is not. A verification that only compared `store.len()` to `store.len()` would
+/// pass this; the real one must not.
+#[test]
+fn verify_config_graph_copy_rejects_a_same_count_but_different_content_copy() {
+    let combined_dir = tempfile::tempdir().expect("tempdir for combined store");
+    let combined_path = combined_dir.path().join("graph_store");
+    let source_triples = build_combined_store(&combined_path);
+
+    let config_dir = tempfile::tempdir().expect("tempdir for config store");
+    let config_store = config_store_at(&config_dir.path().join("config_store"));
+
+    migrate_config_graph_if_needed(&combined_path, &config_store).expect("migration succeeds");
+
+    let graph = NamedNode::new(CONFIG_GRAPH).expect("CONFIG_GRAPH is a valid IRI");
+
+    // Remove one genuine triple...
+    let removed_triple = source_triples
+        .iter()
+        .next()
+        .expect("fixture has at least one triple");
+    let removed_quad = config_store
+        .inner()
+        .quads_for_pattern(None, None, None, Some((&graph).into()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reading quads succeeds")
+        .into_iter()
+        .find(|q| {
+            (
+                q.subject.to_string(),
+                q.predicate.to_string(),
+                q.object.to_string(),
+            ) == *removed_triple
+        })
+        .expect("the chosen triple exists in the freshly migrated config store");
+    config_store
+        .inner()
+        .remove(&removed_quad)
+        .expect("removing exactly one quad from the config store succeeds");
+
+    // ...and insert one fabricated, unrelated triple in its place, under CONFIG_GRAPH, so the
+    // total count is restored to exactly what it was before the swap.
+    let fabricated_quad = Quad::new(
+        NamedNode::new("https://contreforts.ds-labs.org/data/company/not-a-real-company")
+            .expect("fabricated subject IRI is valid"),
+        NamedNode::new(format!("{CORE_NS}slug")).expect("predicate IRI is valid"),
+        Term::Literal(Literal::new_simple_literal("not-a-real-company")),
+        GraphName::NamedNode(graph.clone()),
+    );
+    config_store
+        .inner()
+        .insert(&fabricated_quad)
+        .expect("inserting the fabricated quad succeeds");
+
+    let target_count_after_swap = config_graph_triples(config_store.inner()).len();
+    assert_eq!(
+        target_count_after_swap,
+        source_triples.len(),
+        "precondition: the swap must leave the target's CONFIG_GRAPH triple count exactly equal \
+         to the source's -- otherwise this is not testing count-equality-with-differing-content \
+         at all"
+    );
+
+    let reopened_source = Store::open(&combined_path).expect("the combined store reopens");
+    let result = verify_config_graph_copy(&reopened_source, &config_store);
+    let err = match result {
+        Err(e) => e,
+        Ok(count) => panic!(
+            "verify_config_graph_copy must return Err when the target's CONFIG_GRAPH has the \
+             same triple count ({count}) as the source but different content (one real triple \
+             swapped for one fabricated one) -- a verification that can be satisfied by the \
+             wrong bytes is worthless for data nothing can regenerate"
+        ),
+    };
+    assert!(
+        matches!(
+            err,
+            contreforts_config::ConfigStoreError::ConfigGraphCopyIncomplete { .. }
+        ),
+        "expected ConfigGraphCopyIncomplete, got {err:?}"
+    );
+}
