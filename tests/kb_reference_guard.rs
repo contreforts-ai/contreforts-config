@@ -17,7 +17,7 @@
 //! against `develop` -- sanctioned compile-error RED, same as this crate's other new D5 files.
 
 use contreforts_config::{
-    CompanyConfig, ConfigGraph, ConfigStore, ForgejoConnectorConfig, KgInstanceConfig,
+    AgentConfig, CompanyConfig, ConfigGraph, ConfigStore, ForgejoConnectorConfig, KgInstanceConfig,
     KnowledgeBaseConfig,
 };
 use contreforts_declaration::ConnectorDeclarations;
@@ -163,5 +163,73 @@ fn a_connector_field_set_verbatim_to_a_registered_kb_graph_iri_is_rejected() {
             .expect("lookup succeeds")
             .is_none(),
         "the rejected write must not have registered the connector at all"
+    );
+}
+
+// ── Review addendum: `AgentConfig::knowledge_base_label` is the same shape of reference as the
+// Target-KB link, and was missed by D5's original write path -- `ConfigGraph::set_agent` did not
+// call `reject_kb_graph_reference` at all, because `Agent` is not a connector kind and so never
+// went through `write_connector`'s generic engine or `ALL_CONNECTOR_DESCRIPTORS`. Reproduced
+// directly against `develop` at this chain's own base (`d94a773`) before being fixed: `set_agent`
+// accepted a registered KB's own graph IRI as `knowledge_base_label` with no error at all.
+
+/// The control: an Agent naming a KB by its real label -- the only legitimate shape -- must keep
+/// succeeding. Without this, the rejection test below would still pass against a guard that
+/// refused every `set_agent` call outright.
+#[test]
+fn an_agent_naming_a_kb_by_its_real_label_still_succeeds() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup_company_and_kb(&cg);
+
+    cg.set_agent(
+        "acme",
+        &AgentConfig {
+            label: "bot".to_string(),
+            display_name: None,
+            knowledge_base_label: "support".to_string(),
+            channels: vec![],
+        },
+    )
+    .expect("an agent naming a KB by its real label must still succeed");
+}
+
+/// The concrete no-op risk `set_agent` shared with the pre-fix Target-KB link: passing a KB's
+/// **graph IRI**, not its label, as `knowledge_base_label`. This is exactly a non-`KnowledgeBaseConfig`
+/// record naming a KB graph IRI verbatim -- D5's second invariant's exact violation -- reached
+/// through `set_agent` rather than the Target-KB link or a connector field.
+#[test]
+fn an_agent_naming_a_kb_graph_iri_instead_of_a_label_is_rejected() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    let kb_graph = setup_company_and_kb(&cg);
+
+    let err = cg
+        .set_agent(
+            "acme",
+            &AgentConfig {
+                label: "bot".to_string(),
+                display_name: None,
+                knowledge_base_label: kb_graph.clone(),
+                channels: vec![],
+            },
+        )
+        .expect_err(
+            "passing a KB's graph IRI where a label belongs must be rejected -- this field is \
+             only ever supposed to hold a label, and accepting a graph IRI here creates a second \
+             config record naming it, violating #18 Q3",
+        );
+
+    let message = err.to_string();
+    assert!(
+        message.contains(&kb_graph),
+        "the error must name the offending graph IRI, got: {message:?}"
+    );
+
+    assert!(
+        cg.get_agent("acme", "bot")
+            .expect("lookup succeeds")
+            .is_none(),
+        "the rejected write must not have registered the agent at all"
     );
 }

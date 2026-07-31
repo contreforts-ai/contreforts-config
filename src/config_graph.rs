@@ -2335,10 +2335,11 @@ impl<'a> ConfigGraph<'a> {
     // #18 Q3 / comment 7969: "exactly one config record may name a KB graph IRI -- the KB's own
     // `KnowledgeBaseConfig.graph` -- and no other config record may name one at all." Every
     // registered KB's own graph is the one value nothing *else* may ever store verbatim.
-    // `all_registered_kb_graphs` is the single query both write-time callers
-    // (`write_connector`, `set_connector_target_kb`) and `validate_startup` use to know what
-    // "a registered KB's own graph IRI" currently means -- global across every company, since a
-    // connector in one company could just as easily be handed another company's KB graph IRI.
+    // `all_registered_kb_graphs` is the single query every write-time caller (`write_connector`,
+    // `set_connector_target_kb`, `set_agent`) and `validate_startup` use to know what "a
+    // registered KB's own graph IRI" currently means -- global across every company, since a
+    // connector or agent in one company could just as easily be handed another company's KB
+    // graph IRI.
 
     /// Every currently-registered KB's own `graph`, across every company -- the value set D5's
     /// second invariant reserves to `KnowledgeBaseConfig.graph` alone.
@@ -2500,6 +2501,19 @@ impl<'a> ConfigGraph<'a> {
                     // (see `KnowledgeBaseConfig::kg_instance_label`'s doc comment on the
                     // zero-registered-instances case); there is nothing to check this graph
                     // against.
+                    //
+                    // Flagged forward, not fixed here (D5/D6 review, contreforts-workspace#58):
+                    // this skip is unconditional per-KB, not re-derived from the store's *current*
+                    // instance count the way `resolve_kg_instance_label` does at write time. A KB
+                    // written while zero instances existed keeps `kg_instance_label: None`
+                    // forever unless it is written again -- so if an instance is registered
+                    // *afterwards* and this KB is never re-saved, it stays permanently exempt from
+                    // this check, even though "another instance's data" is now a real, checkable
+                    // concept. Not fixed now: doing so needs reconciliation semantics (what should
+                    // happen to a pre-existing, un-associated KB once instances exist) that D8/D9
+                    // own, not this pass -- and unconditionally flagging every legacy `None` KB the
+                    // moment any instance exists would be noisy for the common, expected
+                    // transitional shape rather than a real corruption.
                     continue;
                 };
                 match instances.iter().find(|i| &i.label == instance_label) {
@@ -2529,7 +2543,13 @@ impl<'a> ConfigGraph<'a> {
         // is the same one list `write_connector` and `remove_connector` already use, so this
         // cannot silently diverge from what the write-time guard covers), across every declared
         // or undeclared namespace resolution -- catching a Target-KB link or any other connector
-        // field corrupted directly via `ConfigStore::inner()`.
+        // field corrupted directly via `ConfigStore::inner()`. Also scans `core:Agent` --
+        // `set_agent`'s `knowledge_base_label` names a KB exactly the way the Target-KB link
+        // does, and `Agent` is not a connector kind, so it is not in `ALL_CONNECTOR_DESCRIPTORS`
+        // and was missed by this scan (and by `set_agent`'s own write-time guard) until this
+        // review found it: a `usesKnowledgeBase` literal set to a registered KB's own graph IRI
+        // was accepted at write time and invisible here, the exact "unchecked reported as fine"
+        // shape this epic's guards exist to close.
         let kb_graphs = match self.all_registered_kb_graphs() {
             Ok(graphs) => graphs,
             Err(e) => {
@@ -2538,8 +2558,11 @@ impl<'a> ConfigGraph<'a> {
             }
         };
         if !kb_graphs.is_empty() {
-            for descriptor in ALL_CONNECTOR_DESCRIPTORS {
-                let type_iri = self.connector_namespace(descriptor).class_iri(descriptor);
+            let connector_type_iris = ALL_CONNECTOR_DESCRIPTORS
+                .iter()
+                .map(|d| (d.kind, self.connector_namespace(d).class_iri(d)));
+            let agent_type_iri = std::iter::once(("agent", format!("{CORE_NS}Agent")));
+            for (kind, type_iri) in connector_type_iris.chain(agent_type_iri) {
                 let sparql = format!(
                     "SELECT ?s ?p ?o WHERE {{ \
                      GRAPH <{CONFIG_GRAPH}> {{ \
@@ -2551,8 +2574,7 @@ impl<'a> ConfigGraph<'a> {
                     Ok(rows) => rows,
                     Err(e) => {
                         violations.push(format!(
-                            "failed to scan connector kind '{}' for D5's second invariant: {e}",
-                            descriptor.kind
+                            "failed to scan '{kind}' for D5's second invariant: {e}"
                         ));
                         continue;
                     }
@@ -2563,7 +2585,7 @@ impl<'a> ConfigGraph<'a> {
                         let s = col(&row, "s").unwrap_or_default();
                         let p = col(&row, "p").unwrap_or_default();
                         violations.push(format!(
-                            "connector '{s}' stores '{o}' on predicate <{p}> -- that value is a \
+                            "'{s}' stores '{o}' on predicate <{p}> -- that value is a \
                              registered knowledge base's own graph IRI, which only that KB's own \
                              `KnowledgeBaseConfig.graph` may hold"
                         ));
@@ -2582,8 +2604,19 @@ impl<'a> ConfigGraph<'a> {
     // ── Agent CRUD ────────────────────────────────────────────────────────────
 
     /// Upsert an Agent for a company.
+    ///
+    /// Enforces D5's second invariant (contreforts-workspace#58, comment 7969; #18 Q3) on
+    /// `config.knowledge_base_label`, the same as `write_connector`'s generic engine and
+    /// `set_connector_target_kb` already do for their own KB-naming fields -- an `AgentConfig` is
+    /// exactly as much "a config record other than the KB's own definition" as a connector's
+    /// Target-KB link is, and was missed when D5 landed: `ALL_CONNECTOR_DESCRIPTORS`-driven
+    /// enforcement never considered `Agent`, which is not a connector kind at all. Without this,
+    /// an agent's `knowledge_base_label` could be set to a registered KB's own `graph` IRI
+    /// verbatim -- the exact violation `tests/kb_reference_guard.rs` proves is rejected for the
+    /// Target-KB link -- through this equally legitimate, pre-existing entry point instead.
     pub fn set_agent(&self, company_slug: &str, config: &AgentConfig) -> Result<()> {
         self.require_company(company_slug)?;
+        self.reject_kb_graph_reference(std::iter::once(config.knowledge_base_label.as_str()))?;
 
         let agent_iri = namespaces::agent_iri(company_slug, &config.label);
         let agent_node = self.node(&agent_iri)?;

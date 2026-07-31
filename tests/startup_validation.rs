@@ -17,7 +17,7 @@
 //! Sanctioned compile-error RED, same as this crate's other new D5/D6 files.
 
 use contreforts_config::{
-    CompanyConfig, ConfigGraph, ConfigStore, ForgejoConnectorConfig, KgInstanceConfig,
+    AgentConfig, CompanyConfig, ConfigGraph, ConfigStore, ForgejoConnectorConfig, KgInstanceConfig,
     KnowledgeBaseConfig,
 };
 use contreforts_core::namespaces::{CONFIG_GRAPH, CORE_NS};
@@ -233,6 +233,78 @@ fn validate_startup_catches_a_target_kb_link_corrupted_to_a_graph_iri_via_the_ra
     let violations = cg.validate_startup().expect_err(
         "a Target-KB link corrupted to hold a KB's graph IRI instead of its label must be \
          reported at startup, even though it never went through the guarded write path",
+    );
+
+    let combined = violations.join("\n");
+    assert!(
+        combined.contains(&kb_graph),
+        "the report must name the offending graph IRI found outside its own KB's definition, \
+         got: {combined:?}"
+    );
+}
+
+/// Review addendum: `Agent` is not a connector kind, so it is not in `ALL_CONNECTOR_DESCRIPTORS`
+/// and the second invariant's original scan never examined `Agent`-typed subjects at all --
+/// `ConfigGraph::set_agent`'s `knowledge_base_label` names a KB exactly the way the Target-KB link
+/// does, and the same raw-store corruption reproduced here for it must be caught the same way.
+#[test]
+fn validate_startup_catches_an_agent_knowledge_base_label_corrupted_to_a_graph_iri_via_the_raw_store()
+ {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+
+    let kb_graph = format!("{PRIMARY_PREFIX}entity/1");
+    cg.set_knowledge_base(
+        "acme",
+        &KnowledgeBaseConfig {
+            label: "support".to_string(),
+            kg_instance_label: Some("primary".to_string()),
+            graph: Some(kb_graph.clone()),
+            vector_store_label: "vs".to_string(),
+        },
+    )
+    .expect("registering the KB succeeds");
+    cg.set_agent(
+        "acme",
+        &AgentConfig {
+            label: "bot".to_string(),
+            display_name: None,
+            knowledge_base_label: "support".to_string(),
+            channels: vec![],
+        },
+    )
+    .expect("the legitimate, label-based agent registration succeeds");
+
+    // Bypass: overwrite the stored `usesKnowledgeBase` literal to the KB's graph IRI directly,
+    // exactly as the unrestricted raw SPARQL update route could -- `set_agent` itself would have
+    // rejected this (see `tests/kb_reference_guard.rs`).
+    let agent_iri = contreforts_core::namespaces::agent_iri("acme", "bot");
+    let agent_node = NamedNode::new(&agent_iri).expect("valid IRI");
+    let uses_kb_pred = NamedNode::new(format!("{CORE_NS}usesKnowledgeBase")).expect("valid IRI");
+    let config_graph = NamedNode::new(CONFIG_GRAPH).expect("valid IRI");
+
+    store
+        .remove_quad(
+            &agent_node,
+            &uses_kb_pred,
+            &Term::Literal(Literal::new_simple_literal("support")),
+            &config_graph,
+        )
+        .expect("removing the original label literal succeeds");
+    store
+        .inner()
+        .insert(&oxigraph::model::Quad::new(
+            agent_node,
+            uses_kb_pred,
+            Term::Literal(Literal::new_simple_literal(&kb_graph)),
+            GraphName::NamedNode(config_graph),
+        ))
+        .expect("inserting the corrupted graph-IRI literal directly succeeds");
+
+    let violations = cg.validate_startup().expect_err(
+        "an Agent's knowledge_base_label corrupted to hold a KB's graph IRI instead of its \
+         label must be reported at startup, even though Agent is not a connector kind",
     );
 
     let combined = violations.join("\n");

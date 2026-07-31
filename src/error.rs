@@ -36,12 +36,36 @@
 //! syntax. Adding a *named* variant per D5/D6 case (matching the D4 pair's own precedent) would
 //! break `contreforts-kg::config_graph`'s `impl From<ConfigGraphError> for GraphError` --
 //! documented on that `match` as deliberately exhaustive, never a wildcard catch-all -- which
-//! lives in a different repo this chain does not touch. Reusing `InvalidIri` keeps every one of
-//! these four new rejections a client-fault domain outcome (not folded into
-//! [`Store`](ConfigGraphError::Store), which is for propagated store failures only) without
-//! requiring a coordinated change across two repos for a case no route exercises yet (D8 still
-//! has to wire a consumer to any of these paths). Revisit this the next time
-//! `contreforts-kg`'s shim changes, rather than growing this enum unilaterally.
+//! lives in a different repo this chain does not touch.
+//!
+//! **Correction to the original landing note (D5/D6 review, this issue):** the original text here
+//! claimed this was deferred because "no route exercises yet" any of these four paths, mirroring
+//! the D4 pair's justification. That claim is false for three of the four. Checked concretely,
+//! not assumed: `contreforts-config-api`'s `POST /companies/{slug}/knowledge-bases` route calls
+//! `ConfigService::set_knowledge_base`, which reaches `ConfigGraph::set_knowledge_base` through
+//! `contreforts-kg`'s shim -- live today, so `kb_instance_unregistered`, `kg_instance_ambiguous`
+//! and `kb_graph_prefix_violation` are all HTTP-reachable. So are every `POST
+//! /companies/{slug}/connectors/*` route, which reach `write_connector` (hence
+//! `kb_graph_referenced_elsewhere`) through the same shim. Only `set_connector_target_kb`'s own
+//! direct rejection is genuinely unreached (no route calls it, matching the D4 pair exactly).
+//!
+//! That correction is *why* `InvalidIri` stays the right call here, not merely the cheap one:
+//! today, all three of the reachable rejections resolve correctly to **400** via
+//! `contreforts-config-api/src/error.rs`'s existing `GraphError::InvalidIri` arm. Minting four
+//! dedicated variants (mirrored 1:1 into `GraphError`, per the D4 pair's own precedent) without
+//! *also* adding matching arms to that file would silently turn those live 400s into 500s the
+//! moment `contreforts-config-api`'s `Self::Graph(_)` catch-all caught them instead -- the exact
+//! regression this crate's own rule exists to prevent, this time self-inflicted by "fixing" the
+//! variant name. Doing this properly is a **three-repo** change (`contreforts-config`,
+//! `contreforts-kg`, `contreforts-config-api`), not the two-repo change the D4 pair's precedent
+//! set, because unlike `KgInstanceLabelConflict`/`KgInstancePrefixConflict` these paths are
+//! already live. `contreforts-config-api` is deliberately out of this chain's footprint (it is
+//! the D8 boundary this shim exists to be removed at), so this is recorded here rather than done
+//! unilaterally: **whoever picks up D7/D8 (which touches `contreforts-config-api` regardless)
+//! should mint these four variants and their status arms together, in one sweep**, rather than
+//! splitting the naming fix from the status-mapping fix it depends on. Revisit this the next
+//! time `contreforts-kg`'s shim changes, rather than growing this enum unilaterally in the
+//! meantime.
 //!
 //! [`Store`](ConfigGraphError::Store) is the fourth variant, and it is deliberately *not* one of
 //! "the three cases the engine raises": it carries an underlying [`ConfigStoreError`] (a SPARQL
@@ -150,12 +174,15 @@ impl ConfigGraphError {
         ))
     }
 
-    /// A config write (a connector field, or the Target-KB link) tried to store, verbatim, a
-    /// value equal to a registered KB's own `graph` -- D5's second invariant (#18 Q3, comment
-    /// 7969): "exactly one config record may name a KB graph IRI -- the KB's own
-    /// `KnowledgeBaseConfig.graph` -- and no other config record may name one at all." Raised
-    /// wherever it is reached: `ConfigGraph::write_connector`'s generic engine (all eleven
-    /// connector kinds' fields) and `ConfigGraph::set_connector_target_kb` directly.
+    /// A config write (a connector field, the Target-KB link, or an Agent's
+    /// `knowledge_base_label`) tried to store, verbatim, a value equal to a registered KB's own
+    /// `graph` -- D5's second invariant (#18 Q3, comment 7969): "exactly one config record may
+    /// name a KB graph IRI -- the KB's own `KnowledgeBaseConfig.graph` -- and no other config
+    /// record may name one at all." Raised wherever it is reached: `ConfigGraph::write_connector`'s
+    /// generic engine (all eleven connector kinds' fields), `ConfigGraph::set_connector_target_kb`
+    /// directly, and `ConfigGraph::set_agent` (added by this review -- `Agent` is not a connector
+    /// kind, so it was missed by D5's original write path entirely; see `set_agent`'s own doc
+    /// comment).
     pub(crate) fn kb_graph_referenced_elsewhere(value: &str) -> Self {
         Self::InvalidIri(format!(
             "'{value}' is a registered knowledge base's own graph IRI -- only that KB's own \
