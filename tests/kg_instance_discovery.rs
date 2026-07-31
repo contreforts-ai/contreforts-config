@@ -28,6 +28,15 @@
 //! decide -- named here rather than guessed at, per the task's own instruction not to decide
 //! genuinely ambiguous points unilaterally.
 //!
+//! **Resolved by the D8 part 1 landing, before this doc comment was updated to say so**: per
+//! contreforts-workspace#58 comment 8127, a2 answered this in the affirmative --
+//! `ConfigGraphError::kg_instance_discovery_none_registered` exists and is wired into
+//! `discover_kg_instance`'s `InstanceLookup::NoneRegistered` arm -- but no test ever pinned it,
+//! which is exactly the gap D8 part 2c's item 4 closes below
+//! (`discovering_with_no_label_and_zero_registered_instances_is_a_named_error`). Left the
+//! surrounding paragraph above intact rather than rewritten, since it accurately records that the
+//! choice was genuinely open at the time this file was first written.
+//!
 //! **Whether this shares D5's existing code path:** it should share the *three-way branching
 //! logic* (so the two rules cannot silently diverge later), but not the function itself.
 //! `resolve_kg_instance_label` is scoped to one `KnowledgeBaseConfig` write (it takes `kb_label`
@@ -178,5 +187,38 @@ fn no_label_with_more_than_one_registered_instance_is_a_named_ambiguity_error() 
         message.contains('2'),
         "the error should name how many instances are registered so the ambiguity is legible, \
          got: {message:?}"
+    );
+}
+
+/// D8 part 2c, item 4 (contreforts-workspace#58, comment 8127: "found during D8 part 1's
+/// review... implemented and correct but uncovered"): `discover_kg_instance(None)` with **zero**
+/// instances registered must be a named error, not an empty success. This is the one case this
+/// file's own top doc comment named as "deliberately not pinned here" when D8 part 1 landed --
+/// `ConfigGraphError::kg_instance_discovery_none_registered` already exists and is already wired
+/// into `discover_kg_instance`'s `InstanceLookup::NoneRegistered` arm
+/// (`src/config_graph.rs`), so this test is expected to pass against current `develop` -- it
+/// closes a coverage gap, not a bug.
+///
+/// The asymmetry this is *not* the same as: `KnowledgeBaseConfig::kg_instance_label`'s own
+/// `None`-with-zero-instances case (`tests/kb_instance_link.rs`) resolves to `Ok(None)` --
+/// "no association yet" is a legitimate state for a KB record, which does not strictly need to
+/// belong to any instance. Discovery has no such escape hatch: a consumer calling this to get a
+/// datadir to open a store cannot do anything useful with "no instance" the way a KB write can,
+/// so zero registered instances must be a real, named failure here, never a silent `Ok`.
+#[test]
+fn discovering_with_no_label_and_zero_registered_instances_is_a_named_error() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let err = cg.discover_kg_instance(None).expect_err(
+        "discovering an instance with none registered at all must be a named error -- there is \
+         nothing useful an empty-success `Ok` could hand back to a consumer that needs a \
+         datadir to open a store",
+    );
+
+    let message = err.to_string();
+    assert!(
+        !message.is_empty(),
+        "the error must carry a human-legible message, got an empty string"
     );
 }
