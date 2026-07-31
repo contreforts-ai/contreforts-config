@@ -24,10 +24,10 @@
 
 use contreforts_config::{
     AgentConfig, ChannelRef, CompanyConfig, ConfigGraph, ConfigStore, ConnectorConfig,
-    ForgejoConnectorConfig, KnowledgeBaseConfig, O365ConnectorAuth, O365ConnectorConfig,
-    PennylaneConnectorConfig, SmtpConnectorConfig, SmtpTlsMode, SparqlTemplateConfig,
-    StalwartConnectorConfig, VectorStoreColumnType, VectorStoreConnectorConfig, VectorStoreKind,
-    all_connector_kinds,
+    ErpNextConnectorConfig, ForgejoConnectorConfig, GitlabConnectorConfig, KnowledgeBaseConfig,
+    O365ConnectorAuth, O365ConnectorConfig, PennylaneConnectorConfig, SmtpConnectorConfig,
+    SmtpTlsMode, SparqlTemplateConfig, StalwartConnectorConfig, VectorStoreColumnType,
+    VectorStoreConnectorConfig, VectorStoreKind, all_connector_kinds,
 };
 use contreforts_core::namespaces::{self, CONFIG_GRAPH, CORE_NS, RDF};
 use contreforts_declaration::{ConnectorDeclarations, ConnectorValidator};
@@ -1433,4 +1433,603 @@ fn vector_store_admin_url_is_write_only_never_returned_by_get_list_or_serializat
         None,
         "no admin URL configured is a reportable state, not an error"
     );
+}
+
+// ── contreforts/contreforts-workspace#58, D8 part 2b item-1 audit (a3) ──────────────────────
+//
+// `crates/contreforts-kg/tests/config_graph.rs` (34 `#[test]`s, deleted in D8 part 2b) was a
+// *separate* integration suite from the inline `#[cfg(test)]` module this file's tests above
+// were ported from (see this file's own top doc comment: it names the inline module and the
+// two tests it deliberately dropped, and never claims to restate the standalone integration
+// file). The deletion commit's claim that the standalone file's coverage "already lives in
+// contreforts-config/tests/config_graph.rs" conflated the two. Per-test accounting (not
+// aggregate count) found roughly half of the 34 with no genuine behavioural counterpart
+// anywhere in this crate's test suite -- gitlab and ERPNext connectors were entirely untested,
+// `group_customer_mapping`'s 4 tests had no counterpart at all, and several CRUD/cascade/typed-
+// literal behaviours were only exercised for one connector kind, not the kinds the deleted
+// tests actually covered. Restored below, against this crate's own API, consolidating pairs
+// the same way `company_add_get_list_round_trip_and_is_idempotent` above already does. Four of
+// the 34 are *not* restored, deliberately: the shim's own `From<ConfigGraphError> for
+// GraphError` conversion tests (`invalid_iri_raised_in_contreforts_config_still_arrives_as_...`,
+// `connector_validation_raised_in_...`, and the two `store_level_*_errors_keep_their_variant...`
+// tests) pinned a conversion that no longer exists now that the shim is deleted; the equivalent
+// concern -- that `InvalidIri`/`ConnectorValidation`/`Store(SparqlSyntax)` still answer 400, not
+// 500 -- now lives, correctly, in `contreforts-config-api`'s own HTTP-level tests
+// (`tests/companies.rs::connector_on_unknown_company_is_a_client_error`,
+// `tests/connectors.rs::malformed_connector_write_is_rejected_through_the_http_layer`,
+// `tests/sparql.rs::a_malformed_{query,update}_is_a_client_error`).
+
+/// Restores `get_company_returns_none_when_missing`.
+#[test]
+fn get_company_returns_none_when_missing() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    assert!(cg.get_company("unknown").unwrap().is_none());
+}
+
+/// Restores `list_companies_returns_all_registered` -- genuinely different from
+/// `company_add_get_list_round_trip_and_is_idempotent` above, which only ever registers one
+/// slug (`"acme"`, added twice). This proves multiple *distinct* companies all come back.
+#[test]
+fn list_companies_returns_all_registered() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.add_company(&CompanyConfig {
+        slug: "a".into(),
+        name: "A".into(),
+    })
+    .unwrap();
+    cg.add_company(&CompanyConfig {
+        slug: "b".into(),
+        name: "B".into(),
+    })
+    .unwrap();
+
+    let mut slugs: Vec<_> = cg
+        .list_companies()
+        .unwrap()
+        .iter()
+        .map(|c| c.slug.clone())
+        .collect();
+    slugs.sort();
+    assert_eq!(slugs, vec!["a", "b"]);
+}
+
+/// Restores `erpnext_connector_round_trip`, `set_erpnext_connector_requires_company` and
+/// `characterization_erpnext_connector_triples_are_pinned`. ERPNext has no declaration
+/// anywhere in this workspace (like nine of the eleven kinds), so it stays under `CORE_NS` --
+/// the same "not migrated yet" state the deleted characterization test pinned, restored here
+/// with the same hand-typed (never `CORE_NS`/`connector_iri`-derived) expected triples.
+#[test]
+fn erpnext_connector_round_trip_requires_a_company_and_stays_under_core_ns() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let err = cg
+        .set_erpnext_connector(
+            "missing",
+            &ErpNextConnectorConfig {
+                company_name: "X".into(),
+                url: "https://x".into(),
+                api_key: "k".into(),
+                api_secret: "s".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("missing"));
+
+    cg.add_company(&CompanyConfig {
+        slug: "acme".into(),
+        name: "Acme Corp".into(),
+    })
+    .unwrap();
+    cg.set_erpnext_connector(
+        "acme",
+        &ErpNextConnectorConfig {
+            company_name: "Acme Co".into(),
+            url: "https://acme.erpnext.com".into(),
+            api_key: "key123".into(),
+            api_secret: "secret456".into(),
+        },
+    )
+    .unwrap();
+
+    let fetched = cg
+        .get_erpnext_connector("acme")
+        .unwrap()
+        .expect("connector present");
+    assert_eq!(fetched.company_name, "Acme Co");
+    assert_eq!(fetched.url, "https://acme.erpnext.com");
+    assert_eq!(fetched.api_key, "key123");
+    assert_eq!(fetched.api_secret, "secret456");
+
+    // Hand-typed, not derived from CORE_NS/connector_iri -- same discipline as this file's other
+    // characterization-style pins.
+    let conn_iri = "https://contreforts.ds-labs.org/data/connector/erpnext/acme";
+    let mut expected = vec![
+        (
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string(),
+            "https://contreforts.ds-labs.org/ontologies/core#ErpNextConnector".to_string(),
+        ),
+        (
+            "https://contreforts.ds-labs.org/ontologies/core#companyName".to_string(),
+            "Acme Co".to_string(),
+        ),
+        (
+            "https://contreforts.ds-labs.org/ontologies/core#instanceUrl".to_string(),
+            "https://acme.erpnext.com".to_string(),
+        ),
+        (
+            "https://contreforts.ds-labs.org/ontologies/core#apiKey".to_string(),
+            "key123".to_string(),
+        ),
+        (
+            "https://contreforts.ds-labs.org/ontologies/core#apiSecret".to_string(),
+            "secret456".to_string(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(stored_triples(&store, conn_iri), expected);
+}
+
+/// Restores `gitlab_connector_round_trip` and `list_connectors_includes_gitlab` -- gitlab had
+/// zero coverage anywhere in this crate's suite.
+#[test]
+fn gitlab_connector_round_trip_and_appears_in_mixed_connector_listing() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_forgejo_connector(
+        slug,
+        &ForgejoConnectorConfig {
+            label: "default".into(),
+            url: "https://git.example.com".into(),
+            token: "t".into(),
+        },
+    )
+    .unwrap();
+    cg.set_gitlab_connector(
+        slug,
+        &GitlabConnectorConfig {
+            label: "eona".into(),
+            url: "https://gitlab.eona-x.org".into(),
+            token: "glpat-xyz".into(),
+        },
+    )
+    .unwrap();
+
+    let fetched = cg
+        .get_gitlab_connector(slug, "eona")
+        .unwrap()
+        .expect("connector present");
+    assert_eq!(fetched.label, "eona");
+    assert_eq!(fetched.url, "https://gitlab.eona-x.org");
+    assert_eq!(fetched.token, "glpat-xyz");
+
+    let listed = cg.list_connectors(slug).unwrap();
+    let mut types: Vec<&str> = listed.iter().map(|c| c.connector_type()).collect();
+    types.sort();
+    assert_eq!(types, vec!["forgejo", "gitlab"]);
+}
+
+/// Restores all four `group_customer_mapping_*` tests -- this feature had no counterpart at all
+/// in this crate's suite despite `set_group_customer_mapping`/`get_customer_for_group` still
+/// being part of the public API. One test: round trip, parent-group walk, child override, and
+/// no-match, the same four properties the deleted file split across four functions.
+#[test]
+fn group_customer_mapping_round_trips_walks_parents_and_lets_a_child_override() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_group_customer_mapping(slug, "gitlab", "eona", "eona-x", "eona-parent")
+        .unwrap();
+    cg.set_group_customer_mapping(slug, "gitlab", "eona", "eona-x/special", "eona-special")
+        .unwrap();
+
+    // Direct round trip.
+    assert_eq!(
+        cg.get_customer_for_group(slug, "gitlab", "eona", "eona-x")
+            .unwrap()
+            .as_deref(),
+        Some("eona-parent")
+    );
+    // Walks up through unmapped parent segments to the nearest mapped ancestor.
+    assert_eq!(
+        cg.get_customer_for_group(slug, "gitlab", "eona", "eona-x/platform/api")
+            .unwrap()
+            .as_deref(),
+        Some("eona-parent")
+    );
+    // A more specific child mapping overrides its parent's.
+    assert_eq!(
+        cg.get_customer_for_group(slug, "gitlab", "eona", "eona-x/special")
+            .unwrap()
+            .as_deref(),
+        Some("eona-special")
+    );
+    assert_eq!(
+        cg.get_customer_for_group(slug, "gitlab", "eona", "eona-x/special/deep")
+            .unwrap()
+            .as_deref(),
+        Some("eona-special"),
+        "a grandchild group inherits the nearest mapped ancestor, not the root"
+    );
+    // No mapping anywhere on the path returns None, not an error.
+    assert!(
+        cg.get_customer_for_group(slug, "gitlab", "eona", "unknown-group")
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Restores `remove_company_also_removes_connectors`.
+#[test]
+fn remove_company_also_removes_its_connectors() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.set_pennylane_connector(
+        slug,
+        &PennylaneConnectorConfig {
+            token: "tok".into(),
+            base_url: None,
+        },
+    )
+    .unwrap();
+
+    cg.remove_company(slug).unwrap();
+
+    assert!(cg.get_company(slug).unwrap().is_none());
+    assert!(cg.get_pennylane_connector(slug).unwrap().is_none());
+}
+
+/// Restores `remove_forgejo_connector_unlinks_and_clears`.
+#[test]
+fn remove_forgejo_connector_unlinks_and_clears() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    cg.set_forgejo_connector(
+        slug,
+        &ForgejoConnectorConfig {
+            label: "default".into(),
+            url: "https://git.example.com".into(),
+            token: "pat".into(),
+        },
+    )
+    .unwrap();
+
+    cg.remove_connector(slug, "forgejo", Some("default"))
+        .unwrap();
+    assert!(cg.get_forgejo_connector(slug, "default").unwrap().is_none());
+    assert!(cg.list_connectors(slug).unwrap().is_empty());
+}
+
+/// Restores `multiple_forgejo_connectors_per_company`.
+#[test]
+fn multiple_forgejo_connectors_per_company_are_independently_addressable() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_forgejo_connector(
+        slug,
+        &ForgejoConnectorConfig {
+            label: "main".into(),
+            url: "https://git1.example.com".into(),
+            token: "t1".into(),
+        },
+    )
+    .unwrap();
+    cg.set_forgejo_connector(
+        slug,
+        &ForgejoConnectorConfig {
+            label: "staging".into(),
+            url: "https://git2.example.com".into(),
+            token: "t2".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(cg.list_forgejo_connectors(slug).unwrap().len(), 2);
+    assert_eq!(
+        cg.get_forgejo_connector(slug, "main").unwrap().unwrap().url,
+        "https://git1.example.com"
+    );
+    assert_eq!(
+        cg.get_forgejo_connector(slug, "staging")
+            .unwrap()
+            .unwrap()
+            .url,
+        "https://git2.example.com"
+    );
+}
+
+/// Restores `list_connectors_reports_all_when_present` -- three *different* connector kinds
+/// (erpnext, pennylane, forgejo) registered together and all showing up in one listing. Not
+/// covered elsewhere: every other `list_connectors` call in this file mixes at most two kinds.
+#[test]
+fn list_connectors_reports_every_kind_when_mixed() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_erpnext_connector(
+        slug,
+        &ErpNextConnectorConfig {
+            company_name: "Acme".into(),
+            url: "https://x".into(),
+            api_key: "k".into(),
+            api_secret: "s".into(),
+        },
+    )
+    .unwrap();
+    cg.set_pennylane_connector(
+        slug,
+        &PennylaneConnectorConfig {
+            token: "t".into(),
+            base_url: None,
+        },
+    )
+    .unwrap();
+    cg.set_forgejo_connector(
+        slug,
+        &ForgejoConnectorConfig {
+            label: "default".into(),
+            url: "https://git.example.com".into(),
+            token: "pat".into(),
+        },
+    )
+    .unwrap();
+
+    let listed = cg.list_connectors(slug).unwrap();
+    let mut types: Vec<&str> = listed.iter().map(|c| c.connector_type()).collect();
+    types.sort();
+    assert_eq!(types, vec!["erpnext", "forgejo", "pennylane"]);
+}
+
+/// Restores the `Some(base_url)` half of `pennylane_connector_round_trip_with_base_url` --
+/// every other pennylane write in this file passes `base_url: None`.
+#[test]
+fn pennylane_connector_round_trip_with_base_url_present() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_pennylane_connector(
+        slug,
+        &PennylaneConnectorConfig {
+            token: "tok".into(),
+            base_url: Some("https://staging.pennylane.test/api".into()),
+        },
+    )
+    .unwrap();
+
+    let fetched = cg
+        .get_pennylane_connector(slug)
+        .unwrap()
+        .expect("connector present");
+    assert_eq!(fetched.token, "tok");
+    assert_eq!(
+        fetched.base_url.as_deref(),
+        Some("https://staging.pennylane.test/api")
+    );
+}
+
+/// Restores `column_type_round_trips_and_defaults_to_vector_when_absent`. Uses
+/// `ConnectorDeclarations::none()` (unlike this file's other column-type coverage, which is all
+/// under the synthetic `vector_store` declaration) because the legacy-data scenario below --
+/// dropping the `columnType` triple by hand -- is about the storage/read default, independent of
+/// declaration/validation, matching the deleted test's own setup.
+#[test]
+fn column_type_round_trips_and_defaults_to_vector_when_absent() {
+    let (_dir, store, slug) = setup();
+    // Wired with the real (synthetic-but-declared) vector_store validator, matching the deleted
+    // test's own setup -- `columnType` lands under `vs:` (`VS_NS` below), not `CORE_NS`, only
+    // because a declaration with an `sh:path` for it is wired in.
+    let validator =
+        ConnectorValidator::new(VECTOR_STORE_INTEGER_DECLARATION_TTL, &all_connector_kinds())
+            .unwrap();
+    let cg = ConfigGraph::with_validator(&store, validator.declarations(), &validator);
+
+    // halfvec(2048) is indexable and vector(2048) is not, so this pair also proves the value is
+    // really carried rather than defaulted on read.
+    cg.set_vector_store_connector(
+        slug,
+        &VectorStoreConnectorConfig {
+            label: "half".into(),
+            kind: VectorStoreKind::Pgvector,
+            url: None,
+            table: None,
+            dimension: 2048,
+            column_type: VectorStoreColumnType::Halfvec,
+            admin_url: None,
+        },
+    )
+    .unwrap();
+
+    let got = cg
+        .get_vector_store_connector(slug, "half")
+        .unwrap()
+        .expect("the connector was just written");
+    assert_eq!(got.column_type, VectorStoreColumnType::Halfvec);
+    assert_eq!(got.dimension, 2048);
+
+    // A pre-columnType-field graph: the same connector, with the columnType triple dropped by
+    // hand. Reading it back must yield `vector`, because that is what such a store was actually
+    // created as.
+    const VS_NS: &str = "https://contreforts.ds-labs.org/ontologies/vectorstore#";
+    let conn_iri = namespaces::connector_iri("vector_store", slug, Some("half"));
+    store
+        .remove_quad(
+            &NamedNode::new(&conn_iri).unwrap(),
+            &NamedNode::new(format!("{VS_NS}columnType")).unwrap(),
+            &Term::Literal(Literal::new_simple_literal("halfvec")),
+            &NamedNode::new(CONFIG_GRAPH).unwrap(),
+        )
+        .expect("drop the columnType triple");
+
+    let legacy = cg
+        .get_vector_store_connector(slug, "half")
+        .unwrap()
+        .expect("still there, just without a column type");
+    assert_eq!(
+        legacy.column_type,
+        VectorStoreColumnType::Vector,
+        "a graph with no columnType describes a vector() table"
+    );
+}
+
+/// Restores `declared_field_without_datatype_stays_plain_string_literal`: `instanceUrl` and
+/// `tableName` both have an `sh:path` in `VECTOR_STORE_INTEGER_DECLARATION_TTL` but deliberately
+/// no `sh:datatype`, contrasted against `dimension`, which does declare one.
+#[test]
+fn declared_field_without_datatype_stays_plain_string_literal() {
+    let (_dir, store, slug) = setup();
+    let validator =
+        ConnectorValidator::new(VECTOR_STORE_INTEGER_DECLARATION_TTL, &all_connector_kinds())
+            .unwrap();
+    let cg = ConfigGraph::with_validator(&store, validator.declarations(), &validator);
+
+    cg.set_vector_store_connector(
+        slug,
+        &VectorStoreConnectorConfig {
+            label: "primary".into(),
+            kind: VectorStoreKind::Pgvector,
+            url: Some("postgres://localhost/test".into()),
+            table: Some("chunks".into()),
+            dimension: 128,
+            column_type: VectorStoreColumnType::Vector,
+            admin_url: None,
+        },
+    )
+    .unwrap();
+
+    const VS_NS: &str = "https://contreforts.ds-labs.org/ontologies/vectorstore#";
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
+    let conn_iri = namespaces::connector_iri("vector_store", slug, Some("primary"));
+    let conn_node = NamedNode::new(&conn_iri).unwrap();
+    let graph_node = NamedNode::new(CONFIG_GRAPH).unwrap();
+    let datatypes = stored_datatypes(&store, &conn_node, &graph_node);
+
+    assert!(
+        datatypes.contains(&(format!("{VS_NS}instanceUrl"), XSD_STRING.to_string())),
+        "instanceUrl has sh:path but no sh:datatype -- must stay a plain literal: {datatypes:?}"
+    );
+    assert!(
+        datatypes.contains(&(format!("{VS_NS}tableName"), XSD_STRING.to_string())),
+        "tableName has sh:path but no sh:datatype -- must stay a plain literal: {datatypes:?}"
+    );
+    assert!(
+        datatypes.contains(&(format!("{VS_NS}dimension"), XSD_INTEGER.to_string())),
+        "dimension does declare xsd:integer, unlike instanceUrl/tableName above: {datatypes:?}"
+    );
+}
+
+/// Restores `undeclared_kind_numeric_fields_stay_untyped` -- the *normal-write* half, distinct
+/// from `undeclared_kind_read_still_defaults_on_a_mismatched_literal` above (which only proves a
+/// hand-corrupted value defaults back rather than erroring). This proves a plain, valid write of
+/// an undeclared kind's numeric field is stored as `xsd:string`, not `xsd:integer`, even with a
+/// validator wired in that declares a real `xsd:integer` field for a *different* kind.
+#[test]
+fn undeclared_kind_numeric_fields_stay_untyped_on_a_normal_write() {
+    let (_dir, store, slug) = setup();
+    let validator =
+        ConnectorValidator::new(VECTOR_STORE_INTEGER_DECLARATION_TTL, &all_connector_kinds())
+            .unwrap();
+    let cg = ConfigGraph::with_validator(&store, validator.declarations(), &validator);
+
+    cg.set_stalwart_connector(
+        slug,
+        &StalwartConnectorConfig {
+            label: "main".into(),
+            jmap_base_url: "https://mail.example.com".into(),
+            admin_user: "admin".into(),
+            admin_pass: "adminpw".into(),
+            listen_port: 8080,
+            state_dir: "/var/lib/stalwart".into(),
+            db_path: "/var/lib/stalwart/db.sqlite".into(),
+            smtp_local_host: "127.0.0.1".into(),
+            smtp_local_port: 25,
+            smtp_relay_host: None,
+            smtp_relay_port: 587,
+            imip_anchor_domain: "mail.example.com".into(),
+            ollama_url: "http://localhost:11434".into(),
+            ollama_model: "llama3".into(),
+            ollama_timeout_secs: 30,
+            customer: None,
+        },
+    )
+    .unwrap();
+
+    const CORE_STALWART_NS: &str = "https://contreforts.ds-labs.org/ontologies/core#";
+    const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+    let conn_iri = namespaces::connector_iri("stalwart", slug, Some("main"));
+    let conn_node = NamedNode::new(&conn_iri).unwrap();
+    let graph_node = NamedNode::new(CONFIG_GRAPH).unwrap();
+    let datatypes = stored_datatypes(&store, &conn_node, &graph_node);
+    for numeric_field in [
+        "listenPort",
+        "smtpLocalPort",
+        "smtpRelayPort",
+        "ollamaTimeoutSecs",
+    ] {
+        assert!(
+            datatypes.contains(&(
+                format!("{CORE_STALWART_NS}{numeric_field}"),
+                XSD_STRING.to_string()
+            )),
+            "stalwart has no declaration here -- {numeric_field} must stay xsd:string, unlike \
+             vector_store's declared xsd:integer dimension: {datatypes:?}"
+        );
+    }
+}
+
+/// Restores the SPARQL-`FILTER`-through-the-query-engine half of
+/// `declared_integer_field_is_stored_typed_and_sparql_numeric_filter_matches`. The datatype
+/// tests elsewhere in this file confirm the literal is tagged `xsd:integer`; this proves that
+/// tag actually satisfies a SPARQL numeric comparison via `ConfigStore::select` (there is no
+/// `ask` on `ConfigStore` -- its own doc comment says the ported engine never calls one -- so
+/// this uses `SELECT`, checking for a non-empty result, the same observable `select`-based
+/// primitive every other test in this file already goes through). `CONTRIBUTING.md` §7's "read
+/// the graph via SPARQL" contract, not store internals.
+#[test]
+fn declared_integer_field_satisfies_a_sparql_numeric_filter() {
+    let (_dir, store, slug) = setup();
+    let validator =
+        ConnectorValidator::new(VECTOR_STORE_INTEGER_DECLARATION_TTL, &all_connector_kinds())
+            .unwrap();
+    let cg = ConfigGraph::with_validator(&store, validator.declarations(), &validator);
+
+    cg.set_vector_store_connector(
+        slug,
+        &VectorStoreConnectorConfig {
+            label: "primary".into(),
+            kind: VectorStoreKind::Pgvector,
+            url: None,
+            table: None,
+            dimension: 1536,
+            column_type: VectorStoreColumnType::Vector,
+            admin_url: None,
+        },
+    )
+    .unwrap();
+
+    const VS_NS: &str = "https://contreforts.ds-labs.org/ontologies/vectorstore#";
+    let matches = format!(
+        "SELECT ?conn WHERE {{ GRAPH <{CONFIG_GRAPH}> {{ \
+           ?conn a <{VS_NS}VectorStoreConnector> ; <{VS_NS}dimension> ?d . \
+           FILTER(?d = 1536 && ?d > 1000) \
+         }} }}"
+    );
+    assert!(
+        !store.select(&matches).unwrap().is_empty(),
+        "a declared xsd:integer literal must satisfy a SPARQL numeric FILTER: {matches}"
+    );
+
+    // Negative control: a range the stored value should NOT satisfy really doesn't match, ruling
+    // out a FILTER that vacuously always passes.
+    let no_match = format!(
+        "SELECT ?conn WHERE {{ GRAPH <{CONFIG_GRAPH}> {{ \
+           ?conn a <{VS_NS}VectorStoreConnector> ; <{VS_NS}dimension> ?d . \
+           FILTER(?d > 2000) \
+         }} }}"
+    );
+    assert!(store.select(&no_match).unwrap().is_empty());
 }
