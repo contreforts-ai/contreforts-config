@@ -393,6 +393,30 @@ fn validate_vector_store_geometry(config: &VectorStoreConnectorConfig) -> Result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeBaseConfig {
     pub label: String,
+    /// Which [`KgInstanceConfig`] this KB's data belongs to, by **label** -- the association D5's
+    /// guard needs before "points into another instance's data" is a checkable property
+    /// (contreforts-workspace#58, comment 7969). `Option`, not required: every `KnowledgeBaseConfig`
+    /// stored before this field existed has no association either, and this type is deserialized
+    /// straight off JSON request bodies elsewhere in the workspace, so a required field would
+    /// silently break that contract too.
+    ///
+    /// Resolution is explicit, never a silent pick, applied by [`ConfigGraph::set_knowledge_base`]:
+    /// - `Some(label)` must name an already-registered [`KgInstanceConfig`], or the write is
+    ///   rejected -- there is nothing for the prefix guard to check a dangling reference against.
+    /// - `None` resolves to the sole registered instance when **exactly one** exists (every
+    ///   deployment that has adopted per-instance identity so far).
+    /// - `None` with **more than one** registered instance is a named error (see
+    ///   [`crate::error::ConfigGraphError::kg_instance_ambiguous`]), not a guess -- silently
+    ///   picking one would reintroduce exactly the "absence presenting as success" failure this
+    ///   epic keeps paying for.
+    /// - `None` with **zero** registered instances is accepted as "no association yet": nothing is
+    ///   registered for this KB to belong to, so the prefix guard has nothing to check and simply
+    ///   does not apply, preserving every caller that predates KG instances entirely (e.g.
+    ///   `contreforts-config-api`'s knowledge-base routes, which have never registered one).
+    ///
+    /// `get_knowledge_base`/`list_knowledge_bases` return the *resolved* label that was actually
+    /// stored, never the `None` that may have been passed in to get there.
+    pub kg_instance_label: Option<String>,
     /// Named graph IRI in Oxigraph (e.g. "http://example.org/code-graph").
     /// `None` means "default graph".
     pub graph: Option<String>,
@@ -970,6 +994,17 @@ impl<'a> ConfigGraph<'a> {
                 resolved_fields.push((field_iri, v, datatype_iri));
             }
         }
+
+        // D5's second invariant (contreforts-workspace#58, comment 7969; #18 Q3): no config
+        // record but a KB's own `KnowledgeBaseConfig.graph` may ever store its graph IRI
+        // verbatim. Scoped to every field this generic engine writes -- all eleven connector
+        // kinds funnel through here, so this is "one list, one caller" for the write path (the
+        // same enumeration `validate_startup` re-checks at startup by scanning every
+        // connector-typed subject) -- deliberately not a blanket scan of every stored literal in
+        // the store, which would false-positive on `SparqlTemplateConfig.pattern` (free-text
+        // SPARQL that may legitimately contain a graph IRI as query text, and which this engine
+        // never writes: `set_sparql_template` has its own, separate write path).
+        self.reject_kb_graph_reference(fields.iter().filter_map(|(_, v)| *v))?;
 
         if let Some(validator) = self.validator {
             let instance = self.connector_instance_graph(&conn_iri, &type_iri, &resolved_fields)?;
@@ -1982,13 +2017,62 @@ impl<'a> ConfigGraph<'a> {
 
     // ── KnowledgeBase CRUD ────────────────────────────────────────────────────
 
+    /// Resolve `kg_instance_label` to a concrete, registered instance label, or `None` when no
+    /// instance is registered at all (contreforts-workspace#58 D5; see the field's own doc
+    /// comment on [`KnowledgeBaseConfig::kg_instance_label`] for the full three-way rule).
+    /// `kb_label` is only used to name the offending KB in an error.
+    fn resolve_kg_instance_label(
+        &self,
+        kb_label: &str,
+        kg_instance_label: &Option<String>,
+    ) -> Result<Option<String>> {
+        match kg_instance_label {
+            Some(label) => {
+                if self.get_kg_instance(label)?.is_none() {
+                    return Err(ConfigGraphError::kb_instance_unregistered(kb_label, label));
+                }
+                Ok(Some(label.clone()))
+            }
+            None => {
+                let instances = self.list_kg_instances()?;
+                match instances.len() {
+                    0 => Ok(None),
+                    1 => Ok(Some(instances[0].label.clone())),
+                    n => Err(ConfigGraphError::kg_instance_ambiguous(kb_label, n)),
+                }
+            }
+        }
+    }
+
     /// Upsert a KnowledgeBase for a company.
+    ///
+    /// Enforces D5's first invariant (contreforts-workspace#58, comment 7969; #18 Q3): once
+    /// `config.kg_instance_label` resolves to a concrete, registered instance (see
+    /// [`Self::resolve_kg_instance_label`]), a `config.graph` that does not fall under that
+    /// instance's assigned IRI prefix is rejected before anything is written (see
+    /// [`ConfigGraphError::kb_graph_prefix_violation`]).
     pub fn set_knowledge_base(
         &self,
         company_slug: &str,
         config: &KnowledgeBaseConfig,
     ) -> Result<()> {
         self.require_company(company_slug)?;
+
+        let resolved_instance =
+            self.resolve_kg_instance_label(&config.label, &config.kg_instance_label)?;
+
+        if let (Some(instance_label), Some(graph)) = (&resolved_instance, &config.graph) {
+            let instance = self
+                .get_kg_instance(instance_label)?
+                .expect("just resolved to a registered instance");
+            if !graph.starts_with(&instance.iri_prefix) {
+                return Err(ConfigGraphError::kb_graph_prefix_violation(
+                    &config.label,
+                    graph,
+                    instance_label,
+                ));
+            }
+        }
 
         let kb_iri = namespaces::knowledge_base_iri(company_slug, &config.label);
         let kb_node = self.node(&kb_iri)?;
@@ -2000,6 +2084,14 @@ impl<'a> ConfigGraph<'a> {
         self.write_literal(&kb_node, &format!("{CORE_NS}label"), &config.label, None)?;
         if let Some(graph) = &config.graph {
             self.write_literal(&kb_node, &format!("{CORE_NS}graphIri"), graph, None)?;
+        }
+        if let Some(instance_label) = &resolved_instance {
+            self.write_literal(
+                &kb_node,
+                &format!("{CORE_NS}kgInstanceLabel"),
+                instance_label,
+                None,
+            )?;
         }
         self.write_literal(
             &kb_node,
@@ -2023,11 +2115,12 @@ impl<'a> ConfigGraph<'a> {
     ) -> Result<Option<KnowledgeBaseConfig>> {
         let kb_iri = namespaces::knowledge_base_iri(company_slug, label);
         let sparql = format!(
-            "SELECT ?graph ?vsLabel WHERE {{ \
+            "SELECT ?graph ?vsLabel ?instLabel WHERE {{ \
              GRAPH <{CONFIG_GRAPH}> {{ \
                <{kb_iri}> a <{CORE_NS}KnowledgeBase> ; \
                           <{CORE_NS}vectorStoreLabel> ?vsLabel . \
                OPTIONAL {{ <{kb_iri}> <{CORE_NS}graphIri> ?graph }} \
+               OPTIONAL {{ <{kb_iri}> <{CORE_NS}kgInstanceLabel> ?instLabel }} \
              }} }}"
         );
         let rows = self.store.select(&sparql)?;
@@ -2035,6 +2128,7 @@ impl<'a> ConfigGraph<'a> {
             None => Ok(None),
             Some(row) => Ok(Some(KnowledgeBaseConfig {
                 label: label.to_string(),
+                kg_instance_label: col(row, "instLabel"),
                 graph: col(row, "graph"),
                 vector_store_label: col(row, "vsLabel").unwrap_or_default(),
             })),
@@ -2045,13 +2139,14 @@ impl<'a> ConfigGraph<'a> {
     pub fn list_knowledge_bases(&self, company_slug: &str) -> Result<Vec<KnowledgeBaseConfig>> {
         let company_iri = namespaces::company_iri(company_slug);
         let sparql = format!(
-            "SELECT ?label ?graph ?vsLabel WHERE {{ \
+            "SELECT ?label ?graph ?vsLabel ?instLabel WHERE {{ \
              GRAPH <{CONFIG_GRAPH}> {{ \
                <{company_iri}> <{CORE_NS}hasKnowledgeBase> ?kb . \
                ?kb a <{CORE_NS}KnowledgeBase> ; \
                    <{CORE_NS}label> ?label ; \
                    <{CORE_NS}vectorStoreLabel> ?vsLabel . \
                OPTIONAL {{ ?kb <{CORE_NS}graphIri> ?graph }} \
+               OPTIONAL {{ ?kb <{CORE_NS}kgInstanceLabel> ?instLabel }} \
              }} }}"
         );
         self.store
@@ -2060,6 +2155,7 @@ impl<'a> ConfigGraph<'a> {
             .map(|row| {
                 Ok(KnowledgeBaseConfig {
                     label: col(&row, "label").unwrap_or_default(),
+                    kg_instance_label: col(&row, "instLabel"),
                     graph: col(&row, "graph"),
                     vector_store_label: col(&row, "vsLabel").unwrap_or_default(),
                 })
@@ -2234,6 +2330,55 @@ impl<'a> ConfigGraph<'a> {
             .map(|instance| instance.label))
     }
 
+    // ── KB-reference guard (contreforts-workspace#58 D5, second invariant) ───
+    //
+    // #18 Q3 / comment 7969: "exactly one config record may name a KB graph IRI -- the KB's own
+    // `KnowledgeBaseConfig.graph` -- and no other config record may name one at all." Every
+    // registered KB's own graph is the one value nothing *else* may ever store verbatim.
+    // `all_registered_kb_graphs` is the single query every write-time caller (`write_connector`,
+    // `set_connector_target_kb`, `set_agent`) and `validate_startup` use to know what "a
+    // registered KB's own graph IRI" currently means -- global across every company, since a
+    // connector or agent in one company could just as easily be handed another company's KB
+    // graph IRI.
+
+    /// Every currently-registered KB's own `graph`, across every company -- the value set D5's
+    /// second invariant reserves to `KnowledgeBaseConfig.graph` alone.
+    fn all_registered_kb_graphs(&self) -> Result<Vec<String>> {
+        let sparql = format!(
+            "SELECT ?graph WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               ?kb a <{CORE_NS}KnowledgeBase> ; <{CORE_NS}graphIri> ?graph \
+             }} }}"
+        );
+        self.store
+            .select(&sparql)?
+            .into_iter()
+            .map(|row| {
+                col(&row, "graph")
+                    .ok_or_else(|| ConfigGraphError::InvalidIri("missing graphIri".into()))
+            })
+            .collect()
+    }
+
+    /// Reject any of `values` that equals a currently-registered KB's own `graph`, naming the
+    /// offending value. Used at every write-time call site of D5's second invariant; see the
+    /// section doc comment above.
+    fn reject_kb_graph_reference<'v>(
+        &self,
+        values: impl IntoIterator<Item = &'v str>,
+    ) -> Result<()> {
+        let kb_graphs = self.all_registered_kb_graphs()?;
+        if kb_graphs.is_empty() {
+            return Ok(());
+        }
+        for value in values {
+            if kb_graphs.iter().any(|g| g == value) {
+                return Err(ConfigGraphError::kb_graph_referenced_elsewhere(value));
+            }
+        }
+        Ok(())
+    }
+
     // ── Target-KB link (contreforts-workspace#58 D4) ─────────────────────────
     //
     // A connector's config names the knowledge base it feeds, one-directionally -- a connector
@@ -2258,6 +2403,8 @@ impl<'a> ConfigGraph<'a> {
         label: Option<&str>,
         kb_label: &str,
     ) -> Result<()> {
+        self.reject_kb_graph_reference(std::iter::once(kb_label))?;
+
         let conn_iri = namespaces::connector_iri(connector_kind, company_slug, label);
         let conn_node = self.node(&conn_iri)?;
         let pred_iri = format!("{CORE_NS}targetKnowledgeBase");
@@ -2300,11 +2447,176 @@ impl<'a> ConfigGraph<'a> {
         Ok(rows.first().and_then(|row| col(row, "kb")))
     }
 
+    // ── Startup validation (contreforts-workspace#58 D5) ─────────────────────
+    //
+    // A write-time-only guard is bypassable through the unrestricted raw SPARQL `update` route
+    // (`contreforts-config-api/src/routes/graph.rs`, D7): anything written directly through
+    // `ConfigStore::inner()` never passes through `set_knowledge_base`, `write_connector` or
+    // `set_connector_target_kb` at all. `validate_startup` re-checks both of D5's invariants
+    // directly against the store's actual contents, so a corruption that arrived any other way
+    // is still caught -- later than write time, but not never.
+
+    /// Re-check both of D5's invariants against the store's actual contents, independent of
+    /// whichever write path (if any) put them there. Returns every violation found, each naming
+    /// the offending record, the offending value, and the rule violated -- not merely the first
+    /// one, so a single corrupted store surfaces its whole problem at once rather than one
+    /// restart at a time.
+    ///
+    /// Meant to be called once at process startup, alongside [`crate::ConfigStore::reload_product_graph`]
+    /// (D6's own startup pass) -- see that method's doc comment for why a startup pass is what
+    /// makes an invariant real rather than merely convenient to check at the one write path that
+    /// happens to exist today.
+    pub fn validate_startup(&self) -> std::result::Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+
+        let instances = self
+            .list_kg_instances()
+            .map_err(|e| vec![format!("failed to list KG instances: {e}")])?;
+        let companies = self
+            .list_companies()
+            .map_err(|e| vec![format!("failed to list companies: {e}")])?;
+
+        // Invariant 1 (contreforts-workspace#58 D5, kb_graph_prefix_guard.rs): a KB's own graph
+        // must fall under its claimed instance's registered prefix. Checked directly off
+        // `list_knowledge_bases`' raw read -- which performs no validation of its own -- rather
+        // than through `set_knowledge_base`, so a KB corrupted via `ConfigStore::inner()` (never
+        // touching that guarded write path) is still examined here.
+        for company in &companies {
+            let kbs = match self.list_knowledge_bases(&company.slug) {
+                Ok(kbs) => kbs,
+                Err(e) => {
+                    violations.push(format!(
+                        "failed to list knowledge bases for company '{}': {e}",
+                        company.slug
+                    ));
+                    continue;
+                }
+            };
+            for kb in kbs {
+                let Some(graph) = &kb.graph else {
+                    continue;
+                };
+                let Some(instance_label) = &kb.kg_instance_label else {
+                    // No association recorded -- nothing registered for this KB to belong to
+                    // (see `KnowledgeBaseConfig::kg_instance_label`'s doc comment on the
+                    // zero-registered-instances case); there is nothing to check this graph
+                    // against.
+                    //
+                    // Flagged forward, not fixed here (D5/D6 review, contreforts-workspace#58):
+                    // this skip is unconditional per-KB, not re-derived from the store's *current*
+                    // instance count the way `resolve_kg_instance_label` does at write time. A KB
+                    // written while zero instances existed keeps `kg_instance_label: None`
+                    // forever unless it is written again -- so if an instance is registered
+                    // *afterwards* and this KB is never re-saved, it stays permanently exempt from
+                    // this check, even though "another instance's data" is now a real, checkable
+                    // concept. Not fixed now: doing so needs reconciliation semantics (what should
+                    // happen to a pre-existing, un-associated KB once instances exist) that D8/D9
+                    // own, not this pass -- and unconditionally flagging every legacy `None` KB the
+                    // moment any instance exists would be noisy for the common, expected
+                    // transitional shape rather than a real corruption.
+                    continue;
+                };
+                match instances.iter().find(|i| &i.label == instance_label) {
+                    Some(instance) => {
+                        if !graph.starts_with(&instance.iri_prefix) {
+                            violations.push(format!(
+                                "knowledge base '{}' (company '{}') claims KG instance '{}', \
+                                 but its graph '{graph}' does not fall under that instance's \
+                                 registered prefix '{}'",
+                                kb.label, company.slug, instance_label, instance.iri_prefix
+                            ));
+                        }
+                    }
+                    None => violations.push(format!(
+                        "knowledge base '{}' (company '{}') names KG instance '{instance_label}', \
+                         which is not registered",
+                        kb.label, company.slug
+                    )),
+                }
+            }
+        }
+
+        // Invariant 2 (contreforts-workspace#58 D5, kb_reference_guard.rs /
+        // tests/startup_validation.rs's Target-KB corruption case): no config record but a KB's
+        // own `KnowledgeBaseConfig.graph` may store a registered KB's graph IRI verbatim. Scanned
+        // directly: every literal object on every connector-typed subject (`ALL_CONNECTOR_DESCRIPTORS`
+        // is the same one list `write_connector` and `remove_connector` already use, so this
+        // cannot silently diverge from what the write-time guard covers), across every declared
+        // or undeclared namespace resolution -- catching a Target-KB link or any other connector
+        // field corrupted directly via `ConfigStore::inner()`. Also scans `core:Agent` --
+        // `set_agent`'s `knowledge_base_label` names a KB exactly the way the Target-KB link
+        // does, and `Agent` is not a connector kind, so it is not in `ALL_CONNECTOR_DESCRIPTORS`
+        // and was missed by this scan (and by `set_agent`'s own write-time guard) until this
+        // review found it: a `usesKnowledgeBase` literal set to a registered KB's own graph IRI
+        // was accepted at write time and invisible here, the exact "unchecked reported as fine"
+        // shape this epic's guards exist to close.
+        let kb_graphs = match self.all_registered_kb_graphs() {
+            Ok(graphs) => graphs,
+            Err(e) => {
+                violations.push(format!("failed to list registered KB graphs: {e}"));
+                Vec::new()
+            }
+        };
+        if !kb_graphs.is_empty() {
+            let connector_type_iris = ALL_CONNECTOR_DESCRIPTORS
+                .iter()
+                .map(|d| (d.kind, self.connector_namespace(d).class_iri(d)));
+            let agent_type_iri = std::iter::once(("agent", format!("{CORE_NS}Agent")));
+            for (kind, type_iri) in connector_type_iris.chain(agent_type_iri) {
+                let sparql = format!(
+                    "SELECT ?s ?p ?o WHERE {{ \
+                     GRAPH <{CONFIG_GRAPH}> {{ \
+                       ?s a <{type_iri}> ; ?p ?o . \
+                       FILTER(isLiteral(?o)) \
+                     }} }}"
+                );
+                let rows = match self.store.select(&sparql) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        violations.push(format!(
+                            "failed to scan '{kind}' for D5's second invariant: {e}"
+                        ));
+                        continue;
+                    }
+                };
+                for row in rows {
+                    let Some(o) = col(&row, "o") else { continue };
+                    if kb_graphs.iter().any(|g| g == &o) {
+                        let s = col(&row, "s").unwrap_or_default();
+                        let p = col(&row, "p").unwrap_or_default();
+                        violations.push(format!(
+                            "'{s}' stores '{o}' on predicate <{p}> -- that value is a \
+                             registered knowledge base's own graph IRI, which only that KB's own \
+                             `KnowledgeBaseConfig.graph` may hold"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
     // ── Agent CRUD ────────────────────────────────────────────────────────────
 
     /// Upsert an Agent for a company.
+    ///
+    /// Enforces D5's second invariant (contreforts-workspace#58, comment 7969; #18 Q3) on
+    /// `config.knowledge_base_label`, the same as `write_connector`'s generic engine and
+    /// `set_connector_target_kb` already do for their own KB-naming fields -- an `AgentConfig` is
+    /// exactly as much "a config record other than the KB's own definition" as a connector's
+    /// Target-KB link is, and was missed when D5 landed: `ALL_CONNECTOR_DESCRIPTORS`-driven
+    /// enforcement never considered `Agent`, which is not a connector kind at all. Without this,
+    /// an agent's `knowledge_base_label` could be set to a registered KB's own `graph` IRI
+    /// verbatim -- the exact violation `tests/kb_reference_guard.rs` proves is rejected for the
+    /// Target-KB link -- through this equally legitimate, pre-existing entry point instead.
     pub fn set_agent(&self, company_slug: &str, config: &AgentConfig) -> Result<()> {
         self.require_company(company_slug)?;
+        self.reject_kb_graph_reference(std::iter::once(config.knowledge_base_label.as_str()))?;
 
         let agent_iri = namespaces::agent_iri(company_slug, &config.label);
         let agent_node = self.node(&agent_iri)?;

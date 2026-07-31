@@ -38,9 +38,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphName, NamedNode, Quad, Term};
 use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
-use oxigraph::store::{StorageError, Store};
+use oxigraph::store::{LoaderError, StorageError, Store};
 
 /// The config store's location under the per-user OS data directory.
 ///
@@ -67,6 +68,27 @@ use oxigraph::store::{StorageError, Store};
 /// distinctness from it. (The HTTP-reachable KG itself is out of scope here —
 /// tracked as its own epic in contreforts/contreforts-kg#33.)
 const CONFIG_STORE_DIR_NAME: &str = "config_store";
+
+/// Reserved named graph holding the build-derived product declarations
+/// (`contreforts-config-api/product`'s `PRODUCT_GRAPH_TTL`), loaded as real, queryable data
+/// rather than staying only a Rust `&'static str` consumed for SHACL validation
+/// (contreforts-workspace#58 D6; #19 O2, answered identically to #18 Q3).
+///
+/// Two enforcement points, one design: [`ConfigStore::insert_quad`] rejects any write targeting
+/// this graph at the moment it is attempted, and [`ConfigStore::reload_product_graph`] is called
+/// at every process startup to rebuild this graph from the binary's own compiled-in data --
+/// which is what makes any edit that slips in another way (the unrestricted raw SPARQL `update`
+/// route this crate does not yet constrain, tracked as D7) transient rather than permanent,
+/// rather than relying on write-time rejection alone.
+///
+/// Kept in this crate rather than promoted to `contreforts_core::namespaces` (ruling 4 on
+/// contreforts-workspace#58's D5/D6 follow-up): nothing outside `contreforts-config` needs this
+/// IRI while D7 (constraining the raw SPARQL route against it) and D8 (consumer rewiring) are out
+/// of scope.
+///
+/// Distinct from [`contreforts_core::namespaces::CONFIG_GRAPH`] -- loading this graph must never
+/// mix build-derived declarations into hand-entered configuration data.
+pub const PRODUCT_GRAPH: &str = "https://contreforts.ds-labs.org/data/graph/product";
 
 /// Env var used to override the config store's datadir, mirroring
 /// `contreforts-core::GraphConfig`'s `GRAPH_STORE_PATH` but with its own name
@@ -188,6 +210,23 @@ pub enum ConfigStoreError {
     /// path-resolution failure above.
     #[error("store error: {0}")]
     Storage(#[from] StorageError),
+
+    /// [`ConfigStore::insert_quad`] refused to write into [`PRODUCT_GRAPH`] -- it is reserved for
+    /// build-derived product declarations, reloaded from scratch at every startup
+    /// (contreforts-workspace#58 D6; #19 O2). Naming the graph in the message is what lets
+    /// `tests/reserved_product_graph.rs`'s rejection tests assert the guard is specific to this
+    /// one graph rather than one that rejects every write outright.
+    #[error(
+        "cannot write into the reserved product graph <{graph}>: it holds build-derived \
+         declarations, is reloaded from scratch at every startup, and is not writable at runtime"
+    )]
+    ReservedGraphWrite { graph: String },
+
+    /// [`ConfigStore::reload_product_graph`] was handed Turtle that failed to parse, or the
+    /// underlying store failed the load -- distinct from [`Self::Storage`] because this always
+    /// originates from that one call, never from an ordinary quad write.
+    #[error("failed to load the reserved product graph: {0}")]
+    ProductGraphLoad(#[from] LoaderError),
 }
 
 /// Configuration's own persistent Oxigraph store, wrapping an `Arc<Store>` so
@@ -293,6 +332,47 @@ impl ConfigStore {
             object.clone(),
             GraphName::NamedNode(graph.clone()),
         ))?;
+        Ok(())
+    }
+
+    /// Write one quad, refusing to target [`PRODUCT_GRAPH`] (contreforts-workspace#58 D6; #19
+    /// O2). This is the write-time half of that invariant; [`Self::reload_product_graph`], called
+    /// at every startup, is what makes any edit that reaches the reserved graph another way (the
+    /// raw SPARQL `update` route this crate does not yet constrain -- D7) transient rather than
+    /// permanent. A write targeting any other, ordinary named graph succeeds exactly as a direct
+    /// `inner().insert(...)` would.
+    pub fn insert_quad(
+        &self,
+        subject: &NamedNode,
+        predicate: &NamedNode,
+        object: &Term,
+        graph: &NamedNode,
+    ) -> Result<(), ConfigStoreError> {
+        if graph.as_str() == PRODUCT_GRAPH {
+            return Err(ConfigStoreError::ReservedGraphWrite {
+                graph: PRODUCT_GRAPH.to_string(),
+            });
+        }
+        self.store.insert(&Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+            GraphName::NamedNode(graph.clone()),
+        ))?;
+        Ok(())
+    }
+
+    /// Rebuild [`PRODUCT_GRAPH`] from `ttl`, replacing whatever it held before
+    /// (contreforts-workspace#58 D6; #19 O2). Meant to be called once at every process startup,
+    /// from the binary's own compiled-in product declarations: because this always clears the
+    /// graph first rather than merging into it, any edit that slipped past
+    /// [`Self::insert_quad`]'s guard another way does not survive the next restart -- the reload
+    /// is what turns "rejected at write time" into "gone even when it wasn't."
+    pub fn reload_product_graph(&self, ttl: &str) -> Result<(), ConfigStoreError> {
+        let graph = NamedNode::new(PRODUCT_GRAPH).expect("PRODUCT_GRAPH is a valid IRI");
+        self.store.clear_graph(&graph)?;
+        let parser = RdfParser::from_format(RdfFormat::Turtle).with_default_graph(graph);
+        self.store.load_from_slice(parser, ttl)?;
         Ok(())
     }
 }

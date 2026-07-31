@@ -52,6 +52,7 @@ fn setup_company_kb_and_connector(cg: &ConfigGraph<'_>) {
         "acme",
         &KnowledgeBaseConfig {
             label: "support".to_string(),
+            kg_instance_label: None,
             graph: None,
             vector_store_label: "primary-vs".to_string(),
         },
