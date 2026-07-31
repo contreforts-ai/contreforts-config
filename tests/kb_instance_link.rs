@@ -33,6 +33,12 @@ fn register_instance(cg: &ConfigGraph<'_>, label: &str, iri_prefix: &str) {
     cg.set_kg_instance(&KgInstanceConfig {
         label: label.to_string(),
         iri_prefix: iri_prefix.to_string(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field, unrelated to
+        // the KB<->instance association this file pins. Derived from the label so callers of
+        // this helper (which never register two instances under the same label -- label
+        // uniqueness is D4's own guard) get distinct datadirs for free, never colliding with
+        // the new datadir-uniqueness guard pinned in tests/kg_instance_datadir.rs.
+        datadir: format!("/var/lib/contreforts/kg-instances/{label}"),
     })
     .expect("registering the instance succeeds");
 }

@@ -32,11 +32,17 @@ fn setup(cg: &ConfigGraph<'_>) {
     cg.set_kg_instance(&KgInstanceConfig {
         label: "primary".to_string(),
         iri_prefix: PRIMARY_PREFIX.to_string(),
+        // D8 part 1 (contreforts-workspace#58): datadir is a new, required field on this
+        // fixture, unrelated to the prefix guard this file pins -- distinct per instance so
+        // this file's fixtures don't incidentally trip the new datadir-uniqueness guard
+        // pinned in tests/kg_instance_datadir.rs.
+        datadir: "/var/lib/contreforts/kg-instances/prefixguard-primary".to_string(),
     })
     .expect("registering the primary instance succeeds");
     cg.set_kg_instance(&KgInstanceConfig {
         label: "other".to_string(),
         iri_prefix: OTHER_PREFIX.to_string(),
+        datadir: "/var/lib/contreforts/kg-instances/prefixguard-other".to_string(),
     })
     .expect("registering the other instance succeeds");
     cg.add_company(&CompanyConfig {
