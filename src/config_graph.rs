@@ -2258,7 +2258,50 @@ impl<'a> ConfigGraph<'a> {
     }
 
     /// Remove a KnowledgeBase and the company's link to it.
+    ///
+    /// D9 (contreforts-workspace#58; #18 Q4, "wipe is not delete"): deleting a KB's *definition*
+    /// is the rare, explicit, referentially-guarded half of the split -- unlike wiping an
+    /// instance's *data* (`contreforts_kg::GraphStore::wipe`, routine, never touches this store),
+    /// deleting a definition that something else still names would leave that something silently
+    /// pointing at nothing. Refuses, before removing anything, when:
+    /// - `(company_slug, label)` names no registered KB at all (a named error, never a silent
+    ///   `Ok(())` indistinguishable from a real deletion -- see
+    ///   [`ConfigGraphError::KnowledgeBaseUnregistered`]);
+    /// - a connector of any of the eleven kinds still targets it via
+    ///   [`Self::set_connector_target_kb`] (checked across every kind and every registered label,
+    ///   singleton and label-scoped alike -- see
+    ///   [`ConfigGraphError::KbDeleteBlockedByConnector`]);
+    /// - an `AgentConfig` still names it via `knowledge_base_label` -- `Agent` is not a connector
+    ///   kind, so it is checked as its own case (see
+    ///   [`ConfigGraphError::KbDeleteBlockedByAgent`]).
+    ///
+    /// Every check runs, and any refusal returns, before a single triple is removed -- a refused
+    /// delete changes nothing, rather than rolling back a partial removal.
     pub fn remove_knowledge_base(&self, company_slug: &str, label: &str) -> Result<()> {
+        if self.get_knowledge_base(company_slug, label)?.is_none() {
+            return Err(ConfigGraphError::knowledge_base_unregistered(
+                company_slug,
+                label,
+            ));
+        }
+
+        if let Some((connector_kind, connector_label)) =
+            self.find_connector_targeting_kb(company_slug, label)?
+        {
+            return Err(ConfigGraphError::kb_delete_blocked_by_connector(
+                label,
+                connector_kind,
+                connector_label.as_deref(),
+            ));
+        }
+
+        if let Some(agent_label) = self.find_agent_using_kb(company_slug, label)? {
+            return Err(ConfigGraphError::kb_delete_blocked_by_agent(
+                label,
+                &agent_label,
+            ));
+        }
+
         let kb_iri = namespaces::knowledge_base_iri(company_slug, label);
         let kb_node = self.node(&kb_iri)?;
         let company_node = self.node(&namespaces::company_iri(company_slug))?;
@@ -2272,6 +2315,56 @@ impl<'a> ConfigGraph<'a> {
             &self.graph,
         )?;
         Ok(())
+    }
+
+    /// The `(kind, label)` of a connector in `company_slug` whose Target-KB link
+    /// (`set_connector_target_kb`) names `kb_label`, if any -- checked across every one of the
+    /// eleven connector kinds, singleton and label-scoped alike (contreforts-workspace#58 D9).
+    /// `label` is `None` for a singleton connector kind (e.g. `erpnext`), which has no label of
+    /// its own; for a label-scoped kind, every currently-registered label of that kind is
+    /// checked via [`Self::list_connector_labels`], so a connector this KB was never linked to at
+    /// all is never mistaken for one that was.
+    fn find_connector_targeting_kb(
+        &self,
+        company_slug: &str,
+        kb_label: &str,
+    ) -> Result<Option<(&'static str, Option<String>)>> {
+        for descriptor in ALL_CONNECTOR_DESCRIPTORS {
+            if descriptor.singleton {
+                if self
+                    .get_connector_target_kb(company_slug, descriptor.kind, None)?
+                    .as_deref()
+                    == Some(kb_label)
+                {
+                    return Ok(Some((descriptor.kind, None)));
+                }
+                continue;
+            }
+            for label in self.list_connector_labels(company_slug, descriptor)? {
+                if self
+                    .get_connector_target_kb(company_slug, descriptor.kind, Some(&label))?
+                    .as_deref()
+                    == Some(kb_label)
+                {
+                    return Ok(Some((descriptor.kind, Some(label))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The label of an `AgentConfig` in `company_slug` whose `knowledge_base_label` names
+    /// `kb_label`, if any (contreforts-workspace#58 D9). `Agent` is not a connector kind, so this
+    /// is a separate check from [`Self::find_connector_targeting_kb`] rather than folded into
+    /// it -- exactly the scope D5's own write-time guard originally missed for `Agent` (see
+    /// `tests/kb_reference_guard.rs`'s review addendum), reproduced here one level up at delete
+    /// time were it not checked on its own.
+    fn find_agent_using_kb(&self, company_slug: &str, kb_label: &str) -> Result<Option<String>> {
+        Ok(self
+            .list_agents(company_slug)?
+            .into_iter()
+            .find(|agent| agent.knowledge_base_label == kb_label)
+            .map(|agent| agent.label))
     }
 
     // ── KG Instance CRUD (contreforts-workspace#58 D4) ───────────────────────
@@ -2475,6 +2568,66 @@ impl<'a> ConfigGraph<'a> {
             .into_iter()
             .find(|instance| instance.datadir.as_deref() == Some(datadir))
             .map(|instance| instance.label))
+    }
+
+    /// Delete a registered KG instance's *definition* record.
+    ///
+    /// D9 (contreforts-workspace#58; #18 Q4, "wipe is not delete"): a separate, explicit, rare
+    /// operation from wiping the instance's *data* (`contreforts_kg::GraphStore::wipe`, routine,
+    /// lives in `contreforts-kg` and never touches this store at all). Refuses, before removing
+    /// anything, when:
+    /// - `label` names no registered instance at all (a named error, never a silent `Ok(())`
+    ///   indistinguishable from a real deletion -- see
+    ///   [`ConfigGraphError::KgInstanceUnregisteredForDelete`]);
+    /// - a `KnowledgeBaseConfig`, in any company, still names this instance via
+    ///   `kg_instance_label` -- the one legitimate config -> instance reference (#18: "config may
+    ///   name a KB in the KB's definition record and nowhere else"). Deleting the instance out
+    ///   from under that KB would leave D5's own graph-prefix guard with nothing to check the
+    ///   KB's graph against, so this is refused (see
+    ///   [`ConfigGraphError::KgInstanceDeleteBlockedByKb`]).
+    ///
+    /// Protecting that one KB -> instance link transitively protects any connector or agent that
+    /// in turn targets that KB (`Self::remove_knowledge_base`'s own guard), without this method
+    /// needing to know anything about connectors or agents at all.
+    ///
+    /// Every check runs, and any refusal returns, before a single triple is removed -- a refused
+    /// delete changes nothing, rather than rolling back a partial removal.
+    pub fn remove_kg_instance(&self, label: &str) -> Result<()> {
+        if self.get_kg_instance(label)?.is_none() {
+            return Err(ConfigGraphError::kg_instance_unregistered_for_delete(label));
+        }
+
+        if let Some((company_slug, kb_label)) = self.find_kb_belonging_to_instance(label)? {
+            return Err(ConfigGraphError::kg_instance_delete_blocked_by_kb(
+                label,
+                &kb_label,
+                &company_slug,
+            ));
+        }
+
+        let node = self.node(&kg_instance_iri(label))?;
+        remove_subject_from_named_graph(self.store, &node, &self.graph)?;
+        Ok(())
+    }
+
+    /// The `(company_slug, kb_label)` of a `KnowledgeBaseConfig`, across every registered
+    /// company, whose `kg_instance_label` names `instance_label`, if any
+    /// (contreforts-workspace#58 D9) -- the single record type that can reference a
+    /// `KgInstanceConfig` by label, verified by grepping the whole workspace for
+    /// `kg_instance_label`/`kgInstanceLabel` (see `tests/kg_instance_delete.rs`'s own module
+    /// doc comment).
+    fn find_kb_belonging_to_instance(
+        &self,
+        instance_label: &str,
+    ) -> Result<Option<(String, String)>> {
+        for company in self.list_companies()? {
+            for kb in self.list_knowledge_bases(&company.slug)? {
+                if kb.kg_instance_label.as_deref() == Some(instance_label) {
+                    return Ok(Some((company.slug, kb.label)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     // ── KB-reference guard (contreforts-workspace#58 D5, second invariant) ───

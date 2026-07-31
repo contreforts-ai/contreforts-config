@@ -65,6 +65,27 @@
 //! -- like every other `GraphError` variant besides the three named ones -- already falls through
 //! to a generic 500 in `contreforts-config-api`'s status mapping, so this does not change any
 //! observed HTTP status.
+//!
+//! Five more, added for D9 (contreforts-workspace#58; #18 Q4, "wipe is not delete"): deleting a
+//! *definition* record (a `KnowledgeBaseConfig` or a `KgInstanceConfig`) is the rare, explicit,
+//! referentially-guarded half of the wipe/delete split, as distinct from wiping an instance's
+//! *data* (`contreforts_kg::GraphStore::wipe`, which never touches this store at all).
+//! [`KnowledgeBaseUnregistered`](ConfigGraphError::KnowledgeBaseUnregistered) and
+//! [`KgInstanceUnregisteredForDelete`](ConfigGraphError::KgInstanceUnregisteredForDelete) reject
+//! an unknown label as a named error rather than a silent no-op;
+//! [`KbDeleteBlockedByConnector`](ConfigGraphError::KbDeleteBlockedByConnector) and
+//! [`KbDeleteBlockedByAgent`](ConfigGraphError::KbDeleteBlockedByAgent) refuse to delete a KB
+//! still referenced by a connector (any of the eleven kinds) or an `AgentConfig` respectively --
+//! `Agent` is not a connector kind, the exact shape D5's own guard originally missed, so it is
+//! its own case rather than folded into the connector one; and
+//! [`KgInstanceDeleteBlockedByKb`](ConfigGraphError::KgInstanceDeleteBlockedByKb) refuses to
+//! delete an instance a KB still belongs to, the one legitimate config -> instance reference.
+//! None of these five reuse `InvalidIri` -- ruling 3 on contreforts-workspace#58's D9 follow-up
+//! is explicit that a reused variant is exactly what D8 part 2c's sweep just finished undoing.
+//! `contreforts-config-api/src/error.rs` maps the two `*Unregistered*`/`*UnregisteredForDelete`
+//! variants to 404 (there is nothing to delete) and the three `*BlockedBy*` variants to 409,
+//! matching the `KgInstance*Conflict` trio's own precedent that a referential conflict is a
+//! client error, not a server fault.
 use crate::ConfigStoreError;
 
 /// The ported config-graph engine's own error type. See the module docs above for the three
@@ -228,6 +249,75 @@ pub enum ConfigGraphError {
          than one, resolution is ambiguous; name one explicitly"
     )]
     KgInstanceDiscoveryAmbiguous { instance_count: usize },
+
+    /// D9 (contreforts-workspace#58; #18 Q4, "wipe is not delete"): `ConfigGraph::remove_knowledge_base`
+    /// was asked to delete a `(company_slug, label)` pair naming no registered
+    /// `KnowledgeBaseConfig`. A silent `Ok(())` here would be indistinguishable from a real
+    /// deletion -- exactly the "absence presenting as success" failure this epic keeps paying
+    /// for -- so an unknown label is a named error instead.
+    #[error(
+        "knowledge base '{label}' is not registered for company '{company_slug}' -- nothing to \
+         delete"
+    )]
+    KnowledgeBaseUnregistered { company_slug: String, label: String },
+
+    /// D9: `ConfigGraph::remove_knowledge_base` refused because a connector -- of any of the
+    /// eleven kinds, singleton or label-scoped -- still targets this KB via
+    /// `ConfigGraph::set_connector_target_kb`. Deleting the KB out from under a connector that
+    /// still names it would leave that connector silently pointing at nothing, the next sync
+    /// failing with no clue why. `connector_label_suffix` is empty for a singleton connector
+    /// kind (e.g. `erpnext`), which has no label of its own to name; for a label-scoped kind it
+    /// is `" (label '<label>')"`, built by
+    /// [`ConfigGraphError::kb_delete_blocked_by_connector`].
+    #[error(
+        "knowledge base '{kb_label}' cannot be deleted: connector '{connector_kind}'\
+         {connector_label_suffix} still targets it -- retarget or remove that connector first"
+    )]
+    KbDeleteBlockedByConnector {
+        kb_label: String,
+        connector_kind: String,
+        connector_label_suffix: String,
+    },
+
+    /// D9: `ConfigGraph::remove_knowledge_base` refused because an `AgentConfig` still names
+    /// this KB via `knowledge_base_label` -- deleting it would leave that agent with no
+    /// knowledge base to answer from. The same "record types that can reference a KB" scope as
+    /// [`Self::KbDeleteBlockedByConnector`], but `Agent` is not a connector kind (the exact shape
+    /// D5's own guard originally missed, see `tests/kb_reference_guard.rs`'s review addendum),
+    /// so it is checked as its own case rather than folded into the connector one.
+    #[error(
+        "knowledge base '{kb_label}' cannot be deleted: agent '{agent_label}' still uses it -- \
+         retarget or remove that agent first"
+    )]
+    KbDeleteBlockedByAgent {
+        kb_label: String,
+        agent_label: String,
+    },
+
+    /// D9: `ConfigGraph::remove_kg_instance` was asked to delete a `label` naming no registered
+    /// `KgInstanceConfig`. Mirrors [`Self::KnowledgeBaseUnregistered`]'s reasoning: a silent
+    /// `Ok(())` here is indistinguishable from a real deletion.
+    #[error("KG instance '{label}' is not registered -- nothing to delete")]
+    KgInstanceUnregisteredForDelete { label: String },
+
+    /// D9: `ConfigGraph::remove_kg_instance` refused because a `KnowledgeBaseConfig` still
+    /// belongs to this instance via `kg_instance_label` -- the one legitimate config -> instance
+    /// reference (#18: "config may name a KB in the KB's definition record and nowhere else").
+    /// Deleting the instance out from under that KB would leave D5's own graph-prefix guard with
+    /// nothing to check the KB's graph against. Protecting this one link transitively protects
+    /// any connector or agent that in turn targets that KB, without this guard needing to know
+    /// anything about connectors or agents -- that reference chain is
+    /// [`Self::KbDeleteBlockedByConnector`] / [`Self::KbDeleteBlockedByAgent`]'s own concern, one
+    /// level down.
+    #[error(
+        "KG instance '{label}' cannot be deleted: knowledge base '{kb_label}' (company \
+         '{company_slug}') still belongs to it -- reassign or remove that knowledge base first"
+    )]
+    KgInstanceDeleteBlockedByKb {
+        label: String,
+        kb_label: String,
+        company_slug: String,
+    },
 }
 
 /// D5/D6/D8-discovery's guard rejections, each raised as one of the seven named variants above
@@ -286,6 +376,58 @@ impl ConfigGraphError {
     /// See [`Self::KgInstanceDiscoveryAmbiguous`].
     pub(crate) fn kg_instance_discovery_ambiguous(instance_count: usize) -> Self {
         Self::KgInstanceDiscoveryAmbiguous { instance_count }
+    }
+
+    /// See [`Self::KnowledgeBaseUnregistered`].
+    pub(crate) fn knowledge_base_unregistered(company_slug: &str, label: &str) -> Self {
+        Self::KnowledgeBaseUnregistered {
+            company_slug: company_slug.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    /// See [`Self::KbDeleteBlockedByConnector`]. `connector_label` is `None` for a singleton
+    /// connector kind, which has no label of its own to name.
+    pub(crate) fn kb_delete_blocked_by_connector(
+        kb_label: &str,
+        connector_kind: &str,
+        connector_label: Option<&str>,
+    ) -> Self {
+        Self::KbDeleteBlockedByConnector {
+            kb_label: kb_label.to_string(),
+            connector_kind: connector_kind.to_string(),
+            connector_label_suffix: connector_label
+                .map(|label| format!(" (label '{label}')"))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// See [`Self::KbDeleteBlockedByAgent`].
+    pub(crate) fn kb_delete_blocked_by_agent(kb_label: &str, agent_label: &str) -> Self {
+        Self::KbDeleteBlockedByAgent {
+            kb_label: kb_label.to_string(),
+            agent_label: agent_label.to_string(),
+        }
+    }
+
+    /// See [`Self::KgInstanceUnregisteredForDelete`].
+    pub(crate) fn kg_instance_unregistered_for_delete(label: &str) -> Self {
+        Self::KgInstanceUnregisteredForDelete {
+            label: label.to_string(),
+        }
+    }
+
+    /// See [`Self::KgInstanceDeleteBlockedByKb`].
+    pub(crate) fn kg_instance_delete_blocked_by_kb(
+        label: &str,
+        kb_label: &str,
+        company_slug: &str,
+    ) -> Self {
+        Self::KgInstanceDeleteBlockedByKb {
+            label: label.to_string(),
+            kb_label: kb_label.to_string(),
+            company_slug: company_slug.to_string(),
+        }
     }
 }
 
