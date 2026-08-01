@@ -1313,6 +1313,88 @@ fn a_patch_renaming_the_label_is_rejected_naming_both_values() {
     );
 }
 
+/// **The one deliberate exception to "clear and omit are different actions", pinned so it is a
+/// decision rather than an accident.** `label` is the only declared field for which an explicit
+/// `None` does *not* clear: the auto-fill below re-establishes it from the normalised label
+/// argument, so `{label: None}` and omitting `label` entirely produce the same write.
+///
+/// That collapse is intentional and it is the safe direction. Actually honouring the clear would
+/// leave the connector subject in place at `…/forgejo/acme/main` carrying no `forgejo:label`
+/// triple, and `list_connector_labels` reads the **field**, not the IRI segment — so the
+/// connector, and the secret stored on it, would vanish from every listing while remaining in
+/// the store. That is the same stranded-connector failure the rename rejection above exists to
+/// prevent, reached by a different route. A patch cannot be allowed to reach it.
+///
+/// **No validator wired, deliberately.** With one, `label`'s own `sh:minCount 1` rejects a write
+/// that dropped the label before anything is stored, so the assertions below would be pinning
+/// SHACL rather than the auto-fill — and `ConfigGraph::new` leaves `validator: None`, which is
+/// the default configuration. Under a mutation that honours the clear, this test must fail at
+/// the assertion showing the connector missing from the typed lister, not at an `.expect`.
+#[test]
+fn an_explicit_none_on_label_is_absorbed_rather_than_stranding_the_connector() {
+    let (_dir, store) = store();
+    add_company(&store, "acme");
+    let ttl = all_declarations_ttl();
+    let validator = validator_for(&ttl);
+    let cg = ConfigGraph::new(&store, validator.declarations());
+
+    cg.set_declared_connector(
+        "acme",
+        "forgejo",
+        Some("main"),
+        &patch(&[
+            ("label", Some("main")),
+            ("instanceUrl", Some("https://git.example.com")),
+            ("token", Some("t0")),
+        ]),
+        &[],
+    )
+    .expect("the initial forgejo connector stores");
+
+    // Key PRESENT, value None -- for every other field this is "clear it".
+    cg.set_declared_connector(
+        "acme",
+        "forgejo",
+        Some("main"),
+        &patch(&[("label", None), ("token", Some("t1"))]),
+        &[],
+    )
+    .expect("a patch clearing `label` must be absorbed, not rejected and not performed");
+
+    let conn_iri = namespaces::connector_iri("forgejo", "acme", Some("main"));
+    assert_eq!(
+        stored_triples(&store, &conn_iri)
+            .into_iter()
+            .filter(|(p, _)| p.ends_with("#label"))
+            .map(|(_, o)| o)
+            .collect::<Vec<_>>(),
+        vec!["main".to_string()],
+        "`{{label: None}}` cleared the declared `label` field. The connector subject is still \
+         stored at {conn_iri} but carries no label triple, so `list_connector_labels` -- which \
+         reads the FIELD, not the IRI segment -- can no longer see it, and the token stored on \
+         it is invisible to every listing. Stored now: {:?}",
+        stored_triples(&store, &conn_iri)
+    );
+    assert_eq!(
+        cg.list_forgejo_connectors("acme")
+            .unwrap()
+            .into_iter()
+            .map(|c| c.label)
+            .collect::<Vec<_>>(),
+        vec!["main".to_string()],
+        "the typed lister must still see the connector after a `{{label: None}}` patch"
+    );
+    let read = cg
+        .get_declared_connector("acme", "forgejo", Some("main"))
+        .unwrap()
+        .expect("the connector must still be readable");
+    assert_eq!(
+        read.get("token").map(String::as_str),
+        Some("t1"),
+        "and the rest of the patch must still have been applied: {read:?}"
+    );
+}
+
 /// The other side of the same rule, and the reason a rename can be rejected without making the
 /// generic route unusable: on a **create**, a patch that omits `label` gets the normalised label
 /// argument written into the declared `label` field.
