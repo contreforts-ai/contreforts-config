@@ -43,7 +43,9 @@ use oxigraph::model::*;
 use serde::{Deserialize, Serialize};
 
 use contreforts_core::namespaces::{self, CONFIG_GRAPH, CORE_NS, RDF};
-use contreforts_declaration::{ConnectorDeclarations, ConnectorIris, ConnectorValidator};
+use contreforts_declaration::{
+    ConnectorDeclarations, ConnectorIris, ConnectorValidator, VariantRule,
+};
 
 use crate::ConfigStore;
 use crate::error::{ConfigGraphError, Result};
@@ -865,6 +867,69 @@ fn remove_subject_from_named_graph(
     Ok(())
 }
 
+/// `remove_subject_from_named_graph` narrowed by one predicate -- the same
+/// `quads_for_pattern` + `remove` loop with the predicate slot bound instead of wildcarded.
+///
+/// This exists for exactly one caller, `write_connector`'s idempotence wipe (phase F W6,
+/// contreforts/contreforts-config#11 change **A**): the connector subject carries triples this
+/// engine does **not** own -- `{CORE_NS}targetKnowledgeBase`, written by
+/// `set_connector_target_kb` -- and a whole-subject delete destroys them on every save. See the
+/// long comment at that call site for why the two windows must match.
+fn remove_subject_predicate_from_named_graph(
+    store: &ConfigStore,
+    subject: &NamedNode,
+    predicate: &NamedNode,
+    graph: &NamedNode,
+) -> Result<()> {
+    let quads: Vec<_> = store
+        .inner()
+        .quads_for_pattern(
+            Some(subject.into()),
+            Some(predicate.into()),
+            None,
+            Some(graph.into()),
+        )
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for quad in quads {
+        store.inner().remove(&quad)?;
+    }
+    Ok(())
+}
+
+/// The two declared datatypes for which the empty string is a legitimate lexical form, spelled
+/// out rather than derived from `namespaces::XSD` because that is a `static`, not a `const`, so
+/// it cannot be concatenated at compile time. Read by `set_declared_connector`'s `Some("")` rule
+/// -- see that method's doc comment for why an empty literal on any *other* declared datatype has
+/// to be a refusal rather than a stored value.
+const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
+const XSD_ANY_URI: &str = "http://www.w3.org/2001/XMLSchema#anyURI";
+
+/// The one normalisation of a caller-supplied connector label, shared by `remove_connector`'s
+/// existing rule and the two generic declared-vocabulary methods: a `singleton` kind forces
+/// `None`, a label-scoped kind defaults to `"default"`.
+///
+/// `namespaces::connector_iri` switches between the two-segment and the three-segment IRI shape
+/// purely on `label.is_some()`, with **no** reference to `descriptor.singleton`, and its own doc
+/// comment says that asymmetry "must not be collapsed into a single shape -- doing so would
+/// silently change stored data". So an unnormalised `Option` reaching `connector_iri` addresses
+/// a *different subject*: `("forgejo", "acme", None)` writes at the singleton IRI no
+/// `get_forgejo_connector` ever reads and no `remove_connector` ever deletes, and
+/// `("erpnext", "acme", Some("x"))` does the mirror image. `write_connector` itself deliberately
+/// does not normalise -- every typed `set_*_connector` already hands it the right shape -- so
+/// this is the generic route's own step, and both `get_declared_connector` and
+/// `set_declared_connector` must apply it identically or reads and writes address different
+/// subjects.
+fn normalised_connector_label(
+    descriptor: &ConnectorDescriptor,
+    label: Option<&str>,
+) -> Option<String> {
+    if descriptor.singleton {
+        None
+    } else {
+        Some(label.unwrap_or("default").to_string())
+    }
+}
+
 // ── ConfigGraph ───────────────────────────────────────────────────────────────
 
 /// CRUD interface for the configuration named graph.
@@ -1059,9 +1124,54 @@ impl<'a> ConfigGraph<'a> {
             }
         }
 
-        // Idempotent: wipe existing connector triples first. This is the guarantee that
+        // Idempotent: clear this connector's existing triples first. That is the guarantee that
         // calling `set_*` again replaces rather than accumulates triples for this connector.
-        remove_subject_from_named_graph(self.store, &conn_node, &self.graph)?;
+        //
+        // **The delete window must equal the write window** (phase F W6,
+        // contreforts/contreforts-config#11 change **A**). This used to be an unconditional
+        // `remove_subject_from_named_graph`, i.e. `quads_for_pattern(Some(subject), None, None,
+        // Some(graph))` -- *every* quad on the connector subject, with no predicate filter. But
+        // the write window below is only `rdf:type` plus this kind's declared field set, and the
+        // connector subject carries at least one triple this engine never writes:
+        // `set_connector_target_kb` puts `{CORE_NS}targetKnowledgeBase` on it, and
+        // `targetKnowledgeBase` appears in no connector's `declaration.ttl` (so it is in no
+        // kind's `ConnectorIris::field_iris`, so no read-merge keyed on declared fields can carry
+        // it forward either). The result was that a routine re-save -- through the generic route
+        // *or* through any of the eleven typed `set_*_connector` methods -- silently destroyed
+        // the connector's target-KB link, and D5's KB-delete guard keys on exactly that link, so
+        // the knowledge base silently became deletable. Pinned by
+        // `tests/declared_connector.rs::{set_declared_connector,set_forgejo_connector}_preserves_the_target_kb_link`
+        // and, against the real declarations, by
+        // `contreforts-config-api`'s `product/tests/declared_connector_seven_kinds.rs`.
+        //
+        // Narrowed for `ConnectorNamespace::Declared` only, deliberately: a `Core` kind (case 2,
+        // no declaration) has no declared field set to narrow *to*, so there is no principled
+        // predicate list and today's whole-subject wipe stays. That scope limit is itself pinned
+        // -- `an_undeclared_kind_still_wipes_the_whole_subject` fails if a later change extends
+        // the narrowing to `Core` kinds, making the extension a reviewed event rather than an
+        // inherited one.
+        match &ns {
+            ConnectorNamespace::Declared(iris) => {
+                let rdf_type = format!("{RDF}type");
+                let predicates = iris.field_iris.values().map(String::as_str).chain([
+                    // `rdf:type` is written unconditionally by `write_type` below, so it is part
+                    // of the write window and must be part of the delete window.
+                    rdf_type.as_str(),
+                ]);
+                for predicate_iri in predicates {
+                    let pred = self.node(predicate_iri)?;
+                    remove_subject_predicate_from_named_graph(
+                        self.store,
+                        &conn_node,
+                        &pred,
+                        &self.graph,
+                    )?;
+                }
+            }
+            ConnectorNamespace::Core => {
+                remove_subject_from_named_graph(self.store, &conn_node, &self.graph)?;
+            }
+        }
 
         self.write_type(&conn_node, &type_iri)?;
         for (predicate_iri, value, datatype_iri) in &resolved_fields {
@@ -1185,6 +1295,313 @@ impl<'a> ConfigGraph<'a> {
             .into_iter()
             .filter_map(|row| col(&row, "label"))
             .collect())
+    }
+
+    // ── Generic declared-vocabulary connector read/write ─────────────────────
+    //
+    // Phase F W6 (contreforts/contreforts-config#11). `get_declared_connector` /
+    // `set_declared_connector` are the two methods W7's
+    // `GET|PUT /api/v1/companies/{slug}/connector-values/{kind}[/{label}]` is the HTTP face of,
+    // and the reason the generated config UI needs no per-kind Rust: both are keyed by
+    // **declared local name** (`instanceUrl`, `apiSecret`, `authMode`, …), the vocabulary
+    // `write_connector`/`fetch_connector` already speak, with no per-kind match arm anywhere
+    // below.
+    //
+    // **What this does not solve, stated here rather than discovered later.**
+    //
+    // 1. *The write is not atomic.* `set_declared_connector` is read → merge → delete → rewrite,
+    //    and `ConfigStore` exposes no transaction API. Two concurrent calls can interleave as
+    //    read-A, read-B, write-A, write-B, and A's field is lost -- the same class of loss the
+    //    read-merge exists to prevent, reintroduced by the mechanism itself. In practice
+    //    `contreforts-config-api` funnels every write through a single writer actor
+    //    (`src/server.rs`'s `spawn_writer`), which serialises them -- but that is the API's
+    //    property, not this crate's, and a second embedder gets no such guarantee.
+    //    contreforts-config#11 "Unsettled 4" leaves whether to add a transaction out of scope.
+    // 2. *`reject_kb_graph_reference` now sees carried-forward values.* `write_connector` runs
+    //    D5's guard over every `Some` value it is handed, and after the merge that set includes
+    //    stored values the caller never touched. A connector that somehow acquired a KB graph
+    //    IRI in a field (reachable only through the raw SPARQL `update` route, which bypasses
+    //    write-time guards -- this crate records that itself) becomes unsavable through the
+    //    generic route with an error naming a field the user never edited. Loud failure, not
+    //    loss; contreforts-config#11 "Unsettled 5".
+    // 3. *Requiredness is not surfaced on the read side.* `get_declared_connector` marks every
+    //    field optional, so it cannot distinguish "stored, empty" from "never stored" beyond the
+    //    key being absent from the map. contreforts-config#11 "Unsettled 2"; W7's `GET` contract
+    //    may want more.
+
+    /// Resolve `kind` to its `(descriptor, declared IRIs)` pair, or a **named** error.
+    ///
+    /// Two distinct refusals, neither of them a silent fallback:
+    ///
+    /// - `kind` is in no `ConnectorDescriptor` at all -- an unrecognised string, not a connector.
+    ///   `InvalidIri`, matching `remove_connector`'s existing refusal for the same input.
+    /// - `kind` is a real connector kind but `self.declarations` has no entry for it, i.e. it
+    ///   resolves to `ConnectorNamespace::Core`. **Not** a `CORE_NS` fallback: a generic route
+    ///   over an undeclared kind has no vocabulary to key on, so it would accept *any* field name
+    ///   and store it under `core:` -- exactly the mixed-namespace state
+    ///   `ConnectorNamespace::field_iri` already refuses per field (contreforts-kg#21). The four
+    ///   undeclared kinds today are `matrix`, `smtp`, `vector_store` and `visio`, each of which
+    ///   has its own typed screen; this is the error a route renders for them.
+    fn resolve_declared_connector(
+        &self,
+        kind: &str,
+    ) -> Result<(&'static ConnectorDescriptor, &'a ConnectorIris)> {
+        let descriptor = ALL_CONNECTOR_DESCRIPTORS
+            .iter()
+            .find(|d| d.kind == kind)
+            .ok_or_else(|| {
+                ConfigGraphError::InvalidIri(format!(
+                    "unknown connector kind '{kind}' (expected \
+                     erpnext|pennylane|forgejo|gitlab|o365|caldav|matrix|smtp|vector_store|stalwart|visio)"
+                ))
+            })?;
+        let iris = self.declarations.connector_iris(kind).ok_or_else(|| {
+            ConfigGraphError::ConnectorValidation(format!(
+                "connector kind '{kind}' has no declaration in force -- a generic \
+                 declared-vocabulary read/write has no field vocabulary to key on for it, and \
+                 core: is not a fallback (contreforts-kg#21)"
+            ))
+        })?;
+        Ok((descriptor, iris))
+    }
+
+    /// This kind's declared field names, sorted -- the read window, the write window and the
+    /// accepted patch-key set, all from the one source (`ConnectorIris::field_iris`) so they
+    /// cannot drift apart.
+    ///
+    /// Sorted only for determinism of the generated SPARQL and of error messages; nothing
+    /// depends on the order.
+    fn declared_field_names(iris: &'a ConnectorIris) -> Vec<&'a str> {
+        let mut names: Vec<&str> = iris.field_iris.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Read one connector's stored values, keyed by declared local name.
+    ///
+    /// `Ok(None)` when the connector is not configured; `Ok(Some(map))` otherwise, where the map
+    /// holds an entry for exactly the fields that have a stored triple -- an absent key means "no
+    /// triple", never an empty-string placeholder (which would be indistinguishable from a stored
+    /// empty literal).
+    ///
+    /// **Every field is queried as optional**, deliberately. `fetch_connector` puts *required*
+    /// predicates in the main graph pattern, so a partially-populated connector would match
+    /// nothing at all and read back as `Ok(None)` -- a user who cleared one field could then
+    /// neither see nor repair any of the others through the same form. Existence is still
+    /// enforced: the `<conn> a <type>` pattern remains, so an unconfigured connector is still
+    /// `Ok(None)` rather than `Ok(Some({}))`.
+    ///
+    /// That makes this reader deliberately more lenient than the typed `get_*_connector` getters,
+    /// which mark most fields required. The asymmetry is pinned by
+    /// `clearing_a_typed_getters_required_field_hides_the_connector_from_it_but_not_from_the_generic_reader`.
+    ///
+    /// `label` is normalised exactly as `remove_connector` normalises it; see
+    /// `normalised_connector_label`. `require_company` runs first -- `fetch_connector` alone does
+    /// not check it, so an unregistered company would otherwise be `Ok(None)`, indistinguishable
+    /// from "company exists, connector not configured", and W7 serves both from one route.
+    pub fn get_declared_connector(
+        &self,
+        company_slug: &str,
+        kind: &str,
+        label: Option<&str>,
+    ) -> Result<Option<BTreeMap<String, String>>> {
+        self.require_company(company_slug)?;
+        let (descriptor, iris) = self.resolve_declared_connector(kind)?;
+        let normalised = normalised_connector_label(descriptor, label);
+
+        let fields: Vec<(&str, bool)> = Self::declared_field_names(iris)
+            .into_iter()
+            .map(|name| (name, false))
+            .collect();
+        self.fetch_connector(company_slug, descriptor, normalised.as_deref(), &fields)
+    }
+
+    /// Apply a patch to one connector, keyed by declared local name.
+    ///
+    /// # The four request states -- omitting a field and clearing a field are different actions
+    ///
+    /// `patch` is `BTreeMap<String, Option<String>>` and **not** `BTreeMap<String, String>`
+    /// precisely because the latter cannot express the user's actions: it has no value meaning
+    /// "clear this field".
+    ///
+    /// | request state | meaning | behaviour |
+    /// |---|---|---|
+    /// | key **absent** | the client is not talking about this field | **unchanged** -- the stored value is carried forward |
+    /// | key present, `Some(v)`, `v != ""` | set it | write `v` |
+    /// | key present, `None` | the user emptied the field and saved | **clear** -- no triple is written |
+    /// | key present, `Some("")` | a browser posts `""`, not JSON `null` | an empty literal for a declared `xsd:string`/`xsd:anyURI` field (or an undeclared datatype); `Err(ConnectorValidation)` naming the field and its datatype for **any other** declared datatype, whether or not a validator is wired |
+    ///
+    /// The absent/`None` distinction is the whole point of the method. `write_connector` drops
+    /// `None` values before it does anything else and then clears the connector, so a route that
+    /// forwarded "field missing from the request body" straight through as `None` would **delete
+    /// the stored value**. W7 serves `GET /connector-values` with secrets elided (D8), so
+    /// "absent" is the *normal* state of every secret on a form round trip -- an elided secret
+    /// coming back must never be indistinguishable from the user clearing that secret.
+    ///
+    /// SHACL does not save you here even with a validator wired: it runs before anything is
+    /// removed, but only rejects a *missing* field some applicable shape requires. A field
+    /// optional in every applicable shape -- `o365:refreshToken`, `o365:userPrincipal`,
+    /// `o365:customer`, `caldav:calendarHome`, `caldav:customer`, `pennylane:baseUrl`,
+    /// `stalwart:smtpRelayHost`, `stalwart:customer` -- validates cleanly and is destroyed. And
+    /// `ConfigGraph::new` leaves `validator: None`, so the no-validator case is the default one.
+    ///
+    /// The `Some("")` rule is not decoration either. `typed_literal` builds
+    /// `Literal::new_typed_literal(value, datatype)` with **no** lexical check, so
+    /// `""^^xsd:integer` is constructible; with no validator wired it is stored, and every
+    /// subsequent read of that connector then fails, because `parse_declared_field` returns
+    /// `Err(DeclaredFieldMismatch)` for a declared kind rather than defaulting. The connector
+    /// becomes unreadable with no path back through the same form. Four stalwart fields are
+    /// `xsd:integer`. The refusal therefore happens **before** anything is written, and is
+    /// independent of `self.validator`.
+    ///
+    /// # Variant reconciliation
+    ///
+    /// `variants` carries W4's `VariantRule`s for `kind` -- field ids only, no RDF. When the
+    /// merged field set selects an alternative (its `discriminant_field` holds that rule's
+    /// `discriminant_value`), every field that alternative `hidden`s is dropped from the merge
+    /// before the write. Without this step "absent key = unchanged" and "switching caldav from
+    /// `basic` to `bearer` leaves no `username`/`password`" contradict each other: the carried
+    /// forward `username`/`password` hit the bearer alternative's `sh:maxCount 0` markers and the
+    /// switch is simply impossible -- and with no validator wired it *succeeds*, leaving a live
+    /// credential stored for an auth mode the connector no longer uses.
+    ///
+    /// The rules are a parameter rather than something this crate derives, per
+    /// contreforts-config#11 "Unsettled 1" option (a): `ConnectorIris` carries nothing about
+    /// `sh:xone`, `ConfigGraph` holds no `Declaration` and no TTL, and re-parsing here would give
+    /// this crate a second parsing path. An empty slice means "no variants", which is correct and
+    /// a no-op for the five of the seven declared kinds that declare no `sh:xone` (erpnext,
+    /// pennylane, forgejo, gitlab, stalwart).
+    ///
+    /// # `label` is the IRI segment and a declared field at once
+    ///
+    /// On five of the seven kinds `label` is simultaneously an IRI segment and a declared
+    /// `sh:path`. The typed setters keep the two equal by construction. A generic patch could
+    /// break that -- `{label: Some("new")}` against IRI segment `old` writes subject `…/old`
+    /// carrying `label "new"`, after which `list_connector_labels` (which reads the *field*)
+    /// reports `new`, `get_<kind>_connector(company, "new")` returns `Ok(None)`, and
+    /// `remove_connector(company, kind, Some("new"))` (which addresses by the *IRI segment*)
+    /// deletes nothing: the stored secret is stranded at an unaddressable IRI. So a patch whose
+    /// `label` differs from the normalised `label` argument is rejected, naming both. Renaming a
+    /// connector is not supported through this path.
+    ///
+    /// Conversely the declared `label` field is **filled from the normalised label argument**,
+    /// on create and on update alike, so a caller never has to state the same string twice and
+    /// can never clear it: writing no `label` triple produces a connector `list_connector_labels`
+    /// cannot see and `get_<kind>_connector` cannot read -- the exact failure the rename rejection
+    /// exists to prevent.
+    ///
+    /// # Refusals
+    ///
+    /// Unknown `kind`, or a kind with no declaration in force: see
+    /// `resolve_declared_connector`. A patch key that is not a declared field: `Err` naming the
+    /// key -- **not** silently projected onto the declared set, because for a form-driven `PUT`
+    /// of a secret the silent branch is a write the client reads back as success while the value
+    /// was never stored. Unregistered company: `Err` from `require_company`.
+    ///
+    /// Every refusal above happens before the merge and before any store mutation, so a rejected
+    /// patch writes nothing at all and leaves the stored connector untouched.
+    ///
+    /// See the section comment above this method for what it deliberately does not solve
+    /// (atomicity, D5's widened guard input, read-side requiredness).
+    pub fn set_declared_connector(
+        &self,
+        company_slug: &str,
+        kind: &str,
+        label: Option<&str>,
+        patch: &BTreeMap<String, Option<String>>,
+        variants: &[VariantRule],
+    ) -> Result<()> {
+        self.require_company(company_slug)?;
+        let (descriptor, iris) = self.resolve_declared_connector(kind)?;
+        let normalised = normalised_connector_label(descriptor, label);
+
+        // ── Refusals, all before any read and any write ──────────────────────
+
+        for key in patch.keys() {
+            if !iris.field_iris.contains_key(key) {
+                return Err(ConfigGraphError::ConnectorValidation(format!(
+                    "connector kind '{kind}' declares no field '{key}' -- a patch key that is \
+                     not a declared field is rejected rather than discarded, because a silently \
+                     dropped key is a value the client believes it saved"
+                )));
+            }
+        }
+
+        if let Some(Some(patched_label)) = patch.get("label")
+            && Some(patched_label.as_str()) != normalised.as_deref()
+        {
+            return Err(ConfigGraphError::ConnectorValidation(format!(
+                "connector is addressed by label '{}' but the patch sets label \
+                 '{patched_label}' -- renaming a connector is not supported through this path: \
+                 the IRI segment and the declared `label` field must stay equal or the stored \
+                 connector becomes unreadable and undeletable",
+                normalised.as_deref().unwrap_or("<none>")
+            )));
+        }
+
+        for (key, value) in patch {
+            if value.as_deref() == Some("")
+                && let Some(datatype) = iris.field_datatypes.get(key)
+                && datatype != XSD_STRING
+                && datatype != XSD_ANY_URI
+            {
+                return Err(ConfigGraphError::ConnectorValidation(format!(
+                    "field '{key}' declares sh:datatype <{datatype}> and the empty string is \
+                     not a valid lexical form for it -- storing \"\"^^<{datatype}> would make \
+                     every subsequent read of this connector fail with DeclaredFieldMismatch, \
+                     with no path back through the same form"
+                )));
+            }
+        }
+
+        // ── Read, merge, reconcile ───────────────────────────────────────────
+
+        let names = Self::declared_field_names(iris);
+        let read_fields: Vec<(&str, bool)> = names.iter().map(|name| (*name, false)).collect();
+        // `unwrap_or_default` is the create case: nothing stored yet, so the merge starts empty
+        // and the patch is the whole connector.
+        let mut merged = self
+            .fetch_connector(
+                company_slug,
+                descriptor,
+                normalised.as_deref(),
+                &read_fields,
+            )?
+            .unwrap_or_default();
+
+        for (key, value) in patch {
+            match value {
+                Some(v) => merged.insert(key.clone(), v.clone()),
+                None => merged.remove(key),
+            };
+        }
+
+        if iris.field_iris.contains_key("label")
+            && let Some(normalised_label) = normalised.as_deref()
+        {
+            merged.insert("label".to_string(), normalised_label.to_string());
+        }
+
+        if let Some(rule) = variants
+            .iter()
+            .find(|rule| merged.get(&rule.discriminant_field) == Some(&rule.discriminant_value))
+        {
+            for hidden in &rule.hidden {
+                merged.remove(hidden);
+            }
+        }
+
+        // ── Write ────────────────────────────────────────────────────────────
+        //
+        // Every declared field is passed, `None` for the ones the merge does not hold --
+        // `write_connector` drops those, and change **A** has already made its delete window the
+        // declared field set plus `rdf:type`, so a dropped field is genuinely removed while
+        // triples this engine does not own (`core:targetKnowledgeBase`) survive.
+        let pairs: Vec<(&str, Option<&str>)> = names
+            .iter()
+            .map(|name| (*name, merged.get(*name).map(String::as_str)))
+            .collect();
+        self.write_connector(company_slug, descriptor, normalised.as_deref(), &pairs)
     }
 
     // ── Company CRUD ──────────────────────────────────────────────────────────
