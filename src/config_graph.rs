@@ -227,6 +227,24 @@ pub struct StalwartConnectorConfig {
 /// Configuration for the Visio generator service (Element Call + Kutt),
 /// multi-instance, label-scoped, optionally narrowed to one customer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CisoAssistantConnectorConfig {
+    pub label: String,
+    pub url: String,
+    pub token: String,
+}
+
+/// A CISO Assistant instance (intuitem), the GRC source behind the RSSI assistant.
+///
+/// contreforts/contreforts-kg#7. The field names match
+/// `contreforts-connector-ciso-assistant/declaration.ttl`'s `contreforts:configField`
+/// annotations -- `url` and `token` -- so the generated form's payload maps straight onto this
+/// struct. `label` carries no annotation there, deliberately: it is identity, not configuration.
+///
+/// Without this descriptor the declaration alone was **worse than nothing**, measured against a
+/// running server: `GET /product-graph/forms/ciso-assistant` served a complete form while
+/// `PUT /connector-values/ciso-assistant/main` answered `400 unknown connector kind`. An
+/// operator could fill in a connector that could not be saved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisioConnectorConfig {
     pub label: String,
     pub listen_port: u16,
@@ -522,6 +540,8 @@ pub enum ConnectorConfig {
     VectorStore(VectorStoreConnectorConfig),
     Stalwart(StalwartConnectorConfig),
     Visio(VisioConnectorConfig),
+    #[serde(rename = "ciso-assistant")]
+    CisoAssistant(CisoAssistantConnectorConfig),
 }
 
 impl ConnectorConfig {
@@ -538,6 +558,7 @@ impl ConnectorConfig {
             Self::VectorStore(_) => "vector_store",
             Self::Stalwart(_) => "stalwart",
             Self::Visio(_) => "visio",
+            Self::CisoAssistant(_) => "ciso-assistant",
         }
     }
 
@@ -579,6 +600,7 @@ impl ConnectorConfig {
             Self::VectorStore(_) => "vector",
             Self::Stalwart(_) => "sidecar",
             Self::Visio(_) => "sidecar",
+            Self::CisoAssistant(_) => "grc",
         }
     }
 }
@@ -668,8 +690,15 @@ const VISIO: ConnectorDescriptor = ConnectorDescriptor {
     type_name: "VisioConnector",
     singleton: false,
 };
+/// contreforts/contreforts-kg#7. `singleton: false` -- a company may hold more than one CISO
+/// Assistant instance, and the declaration's required `label` field says so too.
+const CISO_ASSISTANT: ConnectorDescriptor = ConnectorDescriptor {
+    kind: "ciso-assistant",
+    type_name: "CisoAssistantConnector",
+    singleton: false,
+};
 
-/// All eleven connector kinds, used by `remove_connector` to resolve a `connector_type`
+/// All twelve connector kinds, used by `remove_connector` to resolve a `connector_type`
 /// string to its descriptor without a per-kind match arm.
 const ALL_CONNECTOR_DESCRIPTORS: &[ConnectorDescriptor] = &[
     ERPNEXT,
@@ -683,6 +712,7 @@ const ALL_CONNECTOR_DESCRIPTORS: &[ConnectorDescriptor] = &[
     VECTOR_STORE,
     STALWART,
     VISIO,
+    CISO_ASSISTANT,
 ];
 
 /// Every connector kind's `(kind, type_name)` pair, read off `ALL_CONNECTOR_DESCRIPTORS` --
@@ -2467,6 +2497,64 @@ impl<'a> ConfigGraph<'a> {
             .collect()
     }
 
+    // ── CISO Assistant connector CRUD (contreforts/contreforts-kg#7) ───────────
+
+    /// Upsert a CISO Assistant connector for a company.
+    ///
+    /// The three stored field names are the declaration's own local names
+    /// (`contreforts-connector-ciso-assistant/declaration.ttl`), not this struct's Rust field
+    /// names, which is what `contreforts:configField` exists to state: `url` and `token` are
+    /// annotated there, `label` is not because it is identity.
+    pub fn set_ciso_assistant_connector(
+        &self,
+        company_slug: &str,
+        config: &CisoAssistantConnectorConfig,
+    ) -> Result<()> {
+        self.write_connector(
+            company_slug,
+            &CISO_ASSISTANT,
+            Some(&config.label),
+            &[
+                ("label", Some(config.label.as_str())),
+                ("instanceUrl", Some(config.url.as_str())),
+                ("token", Some(config.token.as_str())),
+            ],
+        )
+    }
+
+    /// Fetch a specific CISO Assistant connector by label.
+    pub fn get_ciso_assistant_connector(
+        &self,
+        company_slug: &str,
+        label: &str,
+    ) -> Result<Option<CisoAssistantConnectorConfig>> {
+        let fields = self.fetch_connector(
+            company_slug,
+            &CISO_ASSISTANT,
+            Some(label),
+            &[("instanceUrl", true), ("token", true)],
+        )?;
+        Ok(fields.map(|f| CisoAssistantConnectorConfig {
+            label: label.to_string(),
+            url: f.get("instanceUrl").cloned().unwrap_or_default(),
+            token: f.get("token").cloned().unwrap_or_default(),
+        }))
+    }
+
+    /// List all CISO Assistant connectors for a company.
+    pub fn list_ciso_assistant_connectors(
+        &self,
+        company_slug: &str,
+    ) -> Result<Vec<CisoAssistantConnectorConfig>> {
+        self.list_connector_labels(company_slug, &CISO_ASSISTANT)?
+            .into_iter()
+            .filter_map(|label| {
+                self.get_ciso_assistant_connector(company_slug, &label)
+                    .transpose()
+            })
+            .collect()
+    }
+
     // ── KG instance resolution (contreforts-workspace#58 D5 / D8 part 1; #18 Q5) ──
     //
     // The three-way branching below -- a named label resolves or errors; no label with exactly
@@ -3650,6 +3738,9 @@ impl<'a> ConfigGraph<'a> {
         }
         for c in self.list_visio_connectors(company_slug)? {
             out.push(ConnectorConfig::Visio(c));
+        }
+        for c in self.list_ciso_assistant_connectors(company_slug)? {
+            out.push(ConnectorConfig::CisoAssistant(c));
         }
         Ok(out)
     }
