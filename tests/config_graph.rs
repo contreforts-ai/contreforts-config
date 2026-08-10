@@ -170,7 +170,15 @@ const VECTOR_STORE_INTEGER_DECLARATION_TTL: &str = r#"
         sh:property [ sh:path vs:tableName ] ;
         sh:property [ sh:path vs:dimension ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ] ;
         sh:property [ sh:path vs:columnType ; sh:datatype xsd:string ; sh:minCount 1 ; sh:maxCount 1 ] ;
-        sh:property [ sh:path vs:adminUrl ; sh:datatype xsd:string ; sh:maxCount 1 ] .
+        sh:property [ sh:path vs:adminUrl ; sh:datatype xsd:string ; sh:maxCount 1 ] ;
+        # contreforts-kg#9's two. Present here because `get_vector_store_connector`
+        # asks for them on every read, and kg#21's guard refuses to read a field a
+        # DECLARED kind has no `sh:path` for -- so the moment `vector_store` stops
+        # being an undeclared kind, its real declaration has to carry these as well.
+        # That coupling is the reason they are here rather than the test being
+        # narrowed to avoid it.
+        sh:property [ sh:path vs:collectionName ; sh:datatype xsd:string ; sh:maxCount 1 ] ;
+        sh:property [ sh:path vs:credentialRef ; sh:datatype xsd:string ; sh:maxCount 1 ] .
 "#;
 
 // ── Test scaffolding ─────────────────────────────────────────────────────────
@@ -1218,6 +1226,8 @@ fn vector_store_connector_round_trips_and_appears_in_the_unified_connector_list(
         kind: VectorStoreKind::Pgvector,
         url: Some("postgres://localhost/test".into()),
         table: Some("chunks".into()),
+        collection: None,
+        credential_ref: None,
         dimension: 384,
         column_type: VectorStoreColumnType::Vector,
         admin_url: None,
@@ -1252,6 +1262,237 @@ fn vector_store_connector_round_trips_and_appears_in_the_unified_connector_list(
     );
 }
 
+/// A Chroma store round-trips with its own two fields, and the credential
+/// reference comes back — unlike `admin_url`.
+///
+/// `contreforts-kg#9`. Both halves are asserted because they are opposite
+/// decisions about the same-looking thing: `credential_ref` holds the **name**
+/// of a secret and is read back so an operator can see which variable a store
+/// is waiting on, where `admin_url` holds a credential and is never read back
+/// at all (`admin_url_is_write_only`). A `credential_ref` quietly elided would
+/// make a correctly configured store look unconfigured.
+#[test]
+fn a_chroma_vector_store_round_trips_with_its_collection_and_credential_reference() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let vs = VectorStoreConnectorConfig {
+        label: "traktion-kb".into(),
+        kind: VectorStoreKind::Chroma,
+        url: Some("http://127.0.0.1:8010".into()),
+        table: None,
+        collection: Some("documents".into()),
+        credential_ref: Some("CONTREFORTS_CHROMA_TOKEN".into()),
+        // pgvector's, and meaningless here: the collection's geometry was fixed
+        // by whoever wrote it and this backend cannot create one. Stored as
+        // given rather than refused, because refusing it would make the field
+        // conditional on a sibling enum in a struct that is deserialised
+        // straight off request bodies.
+        dimension: 4096,
+        column_type: VectorStoreColumnType::Vector,
+        admin_url: None,
+    };
+    cg.set_vector_store_connector(slug, &vs).unwrap();
+
+    let got = cg
+        .get_vector_store_connector(slug, "traktion-kb")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.kind, VectorStoreKind::Chroma);
+    assert_eq!(got.url.as_deref(), Some("http://127.0.0.1:8010"));
+    assert_eq!(got.collection.as_deref(), Some("documents"));
+    assert_eq!(
+        got.credential_ref.as_deref(),
+        Some("CONTREFORTS_CHROMA_TOKEN"),
+        "the credential *reference* is a name, not a secret, and is read back"
+    );
+    assert_eq!(
+        got.table, None,
+        "a chroma store stores no table name; a triple written here would be a \
+         pgvector field on a store that has no table"
+    );
+}
+
+/// A pgvector store stores neither of Chroma's fields.
+///
+/// The sibling of the test above, and the one that catches a `write_connector`
+/// call that stopped skipping `None`: a `collectionName` triple on a pgvector
+/// store is a field that reads as configured on a backend that does not have
+/// it.
+#[test]
+fn a_pgvector_store_stores_neither_of_chromas_fields() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    cg.set_vector_store_connector(
+        slug,
+        &VectorStoreConnectorConfig {
+            label: "primary".into(),
+            kind: VectorStoreKind::Pgvector,
+            url: Some("postgres://localhost/test".into()),
+            table: Some("chunks".into()),
+            collection: None,
+            credential_ref: None,
+            dimension: 384,
+            column_type: VectorStoreColumnType::Vector,
+            admin_url: None,
+        },
+    )
+    .unwrap();
+
+    let got = cg
+        .get_vector_store_connector(slug, "primary")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.collection, None);
+    assert_eq!(got.credential_ref, None);
+}
+
+/// A Chroma store missing something `build_vector_store` requires is refused
+/// **when saved**, not diagnosed at first query.
+///
+/// `contreforts-kg#9`'s last bullet. The two moments are not equivalent: at
+/// save time there is an operator present to be told, and at query time there
+/// is an assistant returning nothing and no error anywhere.
+///
+/// The `table`-instead-of-`collection` case is the one that pins the field
+/// split: a store carrying a table name and no collection must fail for the
+/// missing collection rather than quietly using the table, which is what the
+/// first draft of `contreforts-vecdb#7` did.
+#[test]
+fn an_incomplete_chroma_store_is_refused_at_write_time() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let base = |label: &str| VectorStoreConnectorConfig {
+        label: label.into(),
+        kind: VectorStoreKind::Chroma,
+        url: Some("http://127.0.0.1:8010".into()),
+        table: None,
+        collection: Some("documents".into()),
+        credential_ref: None,
+        dimension: 4096,
+        column_type: VectorStoreColumnType::Vector,
+        admin_url: None,
+    };
+
+    for (case, config, expected) in [
+        (
+            "no url",
+            VectorStoreConnectorConfig {
+                url: None,
+                ..base("no-url")
+            },
+            "a url",
+        ),
+        (
+            "a blank url",
+            VectorStoreConnectorConfig {
+                url: Some("   ".into()),
+                ..base("blank-url")
+            },
+            "a url",
+        ),
+        (
+            "no collection",
+            VectorStoreConnectorConfig {
+                collection: None,
+                ..base("no-collection")
+            },
+            "a collection",
+        ),
+        (
+            "a table but no collection",
+            VectorStoreConnectorConfig {
+                table: Some("rag_chunks".into()),
+                collection: None,
+                ..base("table-not-collection")
+            },
+            "a collection",
+        ),
+    ] {
+        let label = config.label.clone();
+        let err = cg
+            .set_vector_store_connector(slug, &config)
+            .expect_err(&format!(
+                "{case}: an unbuildable chroma store must be refused"
+            ));
+        let message = err.to_string();
+        assert!(
+            message.contains(expected),
+            "{case}: the refusal should name {expected:?}: {message}"
+        );
+        assert!(
+            cg.get_vector_store_connector(slug, &label)
+                .unwrap()
+                .is_none(),
+            "{case}: the refusal has to happen before anything is written"
+        );
+    }
+}
+
+/// A `credential_ref` that is not an environment variable name is refused.
+///
+/// The field holds the **name** of a secret and never the secret: the
+/// configuration graph is queryable, dumpable and backed up
+/// (`contreforts-vecdb#8`). Nothing can prove a string is not a token, but the
+/// shapes a pasted credential actually takes — lowercase hex, base64, anything
+/// with a `-` — are exactly what this rejects, and an operator who pasted one
+/// is told immediately instead of leaving it in the graph looking like
+/// configuration.
+///
+/// Both directions are asserted. A guard that accepted everything would pass a
+/// test that only checked the accept case, and one that accepted nothing would
+/// pass a test that only checked the reject case.
+#[test]
+fn a_credential_reference_that_looks_like_a_secret_is_refused() {
+    let (_dir, store, slug) = setup();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+
+    let with_ref = |label: &str, reference: Option<&str>| VectorStoreConnectorConfig {
+        label: label.into(),
+        kind: VectorStoreKind::Chroma,
+        url: Some("http://127.0.0.1:8010".into()),
+        table: None,
+        collection: Some("documents".into()),
+        credential_ref: reference.map(str::to_string),
+        dimension: 4096,
+        column_type: VectorStoreColumnType::Vector,
+        admin_url: None,
+    };
+
+    for (case, reference) in [
+        (
+            "an environment variable name",
+            Some("CONTREFORTS_CHROMA_TOKEN"),
+        ),
+        ("a leading underscore", Some("_TOKEN")),
+        ("digits after the first character", Some("TOKEN_2")),
+        ("no reference at all", None),
+    ] {
+        let label = format!("ok-{}", reference.unwrap_or("none"));
+        cg.set_vector_store_connector(slug, &with_ref(&label, reference))
+            .unwrap_or_else(|e| panic!("{case} must be accepted: {e}"));
+    }
+
+    for (case, reference) in [
+        ("a lowercase hex token", "54f75d47ff54f32db0052d54efcb4af1"),
+        ("a base64 token", "c2VjcmV0LXRva2Vu="),
+        ("a hyphenated secret-store path", "chroma-token"),
+        ("a slashed secret-store path", "kv/chroma/token"),
+        ("a leading digit", "1TOKEN"),
+        ("empty", ""),
+    ] {
+        let err = cg
+            .set_vector_store_connector(slug, &with_ref("bad", Some(reference)))
+            .expect_err(&format!("{case} must be refused"));
+        assert!(
+            err.to_string().contains("environment variable"),
+            "{case}: the refusal should say what the field is for: {err}"
+        );
+    }
+}
+
 /// Ported/adapted from `crates/contreforts-kg/tests/config_graph.rs`'s
 /// `an_unindexable_geometry_is_refused_at_write_time` (first half): the geometry guard's
 /// dimension-must-be-nonzero branch, which that integration test does not separately cover.
@@ -1268,6 +1509,8 @@ fn vector_store_geometry_rejects_zero_dimension() {
                 kind: VectorStoreKind::Pgvector,
                 url: None,
                 table: None,
+                collection: None,
+                credential_ref: None,
                 dimension: 0,
                 column_type: VectorStoreColumnType::Vector,
                 admin_url: None,
@@ -1308,6 +1551,8 @@ fn vector_store_geometry_rejects_a_dimension_beyond_the_column_types_hnsw_limit(
                 kind: VectorStoreKind::Pgvector,
                 url: None,
                 table: None,
+                collection: None,
+                credential_ref: None,
                 dimension: 3072,
                 column_type: VectorStoreColumnType::Vector,
                 admin_url: None,
@@ -1337,6 +1582,8 @@ fn vector_store_geometry_rejects_a_dimension_beyond_the_column_types_hnsw_limit(
             kind: VectorStoreKind::Pgvector,
             url: None,
             table: None,
+            collection: None,
+            credential_ref: None,
             dimension: 3072,
             column_type: VectorStoreColumnType::Halfvec,
             admin_url: None,
@@ -1359,6 +1606,8 @@ fn vector_store_geometry_is_not_checked_for_an_in_memory_store() {
             kind: VectorStoreKind::InMemory,
             url: None,
             table: None,
+            collection: None,
+            credential_ref: None,
             dimension: 999_999,
             column_type: VectorStoreColumnType::Vector,
             admin_url: None,
@@ -1383,6 +1632,8 @@ fn vector_store_admin_url_is_write_only_never_returned_by_get_list_or_serializat
             kind: VectorStoreKind::Pgvector,
             url: Some("postgres://ro_role:pw@db.internal:5432/kb".into()),
             table: Some("kb_chunks".into()),
+            collection: None,
+            credential_ref: None,
             dimension: 1024,
             column_type: VectorStoreColumnType::Vector,
             admin_url: Some(ADMIN.into()),
@@ -1422,6 +1673,8 @@ fn vector_store_admin_url_is_write_only_never_returned_by_get_list_or_serializat
             kind: VectorStoreKind::Pgvector,
             url: None,
             table: None,
+            collection: None,
+            credential_ref: None,
             dimension: 1024,
             column_type: VectorStoreColumnType::Vector,
             admin_url: None,
@@ -1836,6 +2089,8 @@ fn column_type_round_trips_and_defaults_to_vector_when_absent() {
             kind: VectorStoreKind::Pgvector,
             url: None,
             table: None,
+            collection: None,
+            credential_ref: None,
             dimension: 2048,
             column_type: VectorStoreColumnType::Halfvec,
             admin_url: None,
@@ -1893,6 +2148,8 @@ fn declared_field_without_datatype_stays_plain_string_literal() {
             kind: VectorStoreKind::Pgvector,
             url: Some("postgres://localhost/test".into()),
             table: Some("chunks".into()),
+            collection: None,
+            credential_ref: None,
             dimension: 128,
             column_type: VectorStoreColumnType::Vector,
             admin_url: None,
@@ -2004,6 +2261,8 @@ fn declared_integer_field_satisfies_a_sparql_numeric_filter() {
             kind: VectorStoreKind::Pgvector,
             url: None,
             table: None,
+            collection: None,
+            credential_ref: None,
             dimension: 1536,
             column_type: VectorStoreColumnType::Vector,
             admin_url: None,
