@@ -21,12 +21,13 @@ pub mod error;
 pub mod migration;
 
 pub use config_graph::{
-    AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef, CompanyConfig,
-    ConfigGraph, ConnectorConfig, ErpNextConnectorConfig, ForgejoConnectorConfig,
-    GitlabConnectorConfig, KgInstanceConfig, KnowledgeBaseConfig, MatrixConnectorConfig,
-    O365ConnectorAuth, O365ConnectorConfig, PennylaneConnectorConfig, SmtpConnectorConfig,
-    SmtpTlsMode, SparqlTemplateConfig, StalwartConnectorConfig, VectorStoreColumnType,
-    VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig, all_connector_kinds,
+    AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef,
+    CisoAssistantConnectorConfig, CompanyConfig, ConfigGraph, ConnectorConfig,
+    ErpNextConnectorConfig, ForgejoConnectorConfig, GitlabConnectorConfig, KgInstanceConfig,
+    KnowledgeBaseConfig, MatrixConnectorConfig, O365ConnectorAuth, O365ConnectorConfig,
+    PennylaneConnectorConfig, SmtpConnectorConfig, SmtpTlsMode, SparqlTemplateConfig,
+    StalwartConnectorConfig, VectorStoreColumnType, VectorStoreConnectorConfig, VectorStoreKind,
+    VisioConnectorConfig, all_connector_kinds,
 };
 pub use migration::{MigrationOutcome, migrate_config_graph_if_needed, verify_config_graph_copy};
 // Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
