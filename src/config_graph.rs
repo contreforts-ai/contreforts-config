@@ -227,6 +227,24 @@ pub struct StalwartConnectorConfig {
 /// Configuration for the Visio generator service (Element Call + Kutt),
 /// multi-instance, label-scoped, optionally narrowed to one customer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMirrorConnectorConfig {
+    pub label: String,
+    pub mirror_root: String,
+    pub max_documents: u32,
+    pub max_excerpts_per_document: u32,
+}
+
+/// A flat text mirror of the document corpus, the backend `kb_grep` had none of.
+///
+/// contreforts/contreforts-kg#10. Four stored fields, matching
+/// `contreforts-connector-text-mirror/declaration.ttl` exactly.
+///
+/// **There is no ACL field here, deliberately.** The mirror is the same content as the corpus in
+/// another form, so a root readable outside its perimeter reproduces every restricted document
+/// as plain text. The boundary is the filesystem and the one-binary-one-corpus process that
+/// reads it — one mirror per perimeter. A field on this struct would look like a boundary and
+/// hold nothing, which is worse than its absence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CisoAssistantConnectorConfig {
     pub label: String,
     pub url: String,
@@ -542,6 +560,8 @@ pub enum ConnectorConfig {
     Visio(VisioConnectorConfig),
     #[serde(rename = "ciso-assistant")]
     CisoAssistant(CisoAssistantConnectorConfig),
+    #[serde(rename = "text-mirror")]
+    TextMirror(TextMirrorConnectorConfig),
 }
 
 impl ConnectorConfig {
@@ -559,6 +579,7 @@ impl ConnectorConfig {
             Self::Stalwart(_) => "stalwart",
             Self::Visio(_) => "visio",
             Self::CisoAssistant(_) => "ciso-assistant",
+            Self::TextMirror(_) => "text-mirror",
         }
     }
 
@@ -601,6 +622,7 @@ impl ConnectorConfig {
             Self::Stalwart(_) => "sidecar",
             Self::Visio(_) => "sidecar",
             Self::CisoAssistant(_) => "grc",
+            Self::TextMirror(_) => "corpus",
         }
     }
 }
@@ -697,8 +719,15 @@ const CISO_ASSISTANT: ConnectorDescriptor = ConnectorDescriptor {
     type_name: "CisoAssistantConnector",
     singleton: false,
 };
+/// contreforts/contreforts-kg#10. `singleton: false` -- one mirror per perimeter is the ACL
+/// model, so a company holding several perimeters holds several mirrors.
+const TEXT_MIRROR: ConnectorDescriptor = ConnectorDescriptor {
+    kind: "text-mirror",
+    type_name: "TextMirrorConnector",
+    singleton: false,
+};
 
-/// All twelve connector kinds, used by `remove_connector` to resolve a `connector_type`
+/// All thirteen connector kinds, used by `remove_connector` to resolve a `connector_type`
 /// string to its descriptor without a per-kind match arm.
 const ALL_CONNECTOR_DESCRIPTORS: &[ConnectorDescriptor] = &[
     ERPNEXT,
@@ -713,6 +742,7 @@ const ALL_CONNECTOR_DESCRIPTORS: &[ConnectorDescriptor] = &[
     STALWART,
     VISIO,
     CISO_ASSISTANT,
+    TEXT_MIRROR,
 ];
 
 /// Every connector kind's `(kind, type_name)` pair, read off `ALL_CONNECTOR_DESCRIPTORS` --
@@ -2555,6 +2585,85 @@ impl<'a> ConfigGraph<'a> {
             .collect()
     }
 
+    // ── Text-mirror connector CRUD (contreforts/contreforts-kg#10) ─────────────
+
+    /// Upsert a text-mirror connector for a company.
+    pub fn set_text_mirror_connector(
+        &self,
+        company_slug: &str,
+        config: &TextMirrorConnectorConfig,
+    ) -> Result<()> {
+        let max_documents = config.max_documents.to_string();
+        let max_excerpts = config.max_excerpts_per_document.to_string();
+        self.write_connector(
+            company_slug,
+            &TEXT_MIRROR,
+            Some(&config.label),
+            &[
+                ("label", Some(config.label.as_str())),
+                ("mirrorRoot", Some(config.mirror_root.as_str())),
+                ("maxDocuments", Some(max_documents.as_str())),
+                ("maxExcerptsPerDocument", Some(max_excerpts.as_str())),
+            ],
+        )
+    }
+
+    /// Fetch a specific text-mirror connector by label.
+    ///
+    /// The two bounds have no default here, unlike (say) visio's `listen_port`. A default bound
+    /// is one nobody chose, and the case it guards against -- an assistant asking for `.` and
+    /// receiving the corpus -- is exactly the case where nobody thought about it. A stored
+    /// value that fails to parse is an error, not a silent fallback.
+    pub fn get_text_mirror_connector(
+        &self,
+        company_slug: &str,
+        label: &str,
+    ) -> Result<Option<TextMirrorConnectorConfig>> {
+        let fields = self.fetch_connector(
+            company_slug,
+            &TEXT_MIRROR,
+            Some(label),
+            &[
+                ("mirrorRoot", true),
+                ("maxDocuments", true),
+                ("maxExcerptsPerDocument", true),
+            ],
+        )?;
+        let ns = self.connector_namespace(&TEXT_MIRROR);
+        fields
+            .map(|f| {
+                let max_documents =
+                    parse_declared_field(&ns, "maxDocuments", f.get("maxDocuments"), 0u32)?;
+                let max_excerpts_per_document = parse_declared_field(
+                    &ns,
+                    "maxExcerptsPerDocument",
+                    f.get("maxExcerptsPerDocument"),
+                    0u32,
+                )?;
+                Ok(TextMirrorConnectorConfig {
+                    label: label.to_string(),
+                    mirror_root: f.get("mirrorRoot").cloned().unwrap_or_default(),
+                    max_documents,
+                    max_excerpts_per_document,
+                })
+            })
+            .transpose()
+    }
+
+    /// List all text-mirror connectors for a company.
+    pub fn list_text_mirror_connectors(
+        &self,
+        company_slug: &str,
+    ) -> Result<Vec<TextMirrorConnectorConfig>> {
+        self.list_connector_labels(company_slug, &TEXT_MIRROR)?
+            .into_iter()
+            .filter_map(|label| {
+                self.get_text_mirror_connector(company_slug, &label)
+                    .transpose()
+            })
+            .collect()
+    }
+
     // ── KG instance resolution (contreforts-workspace#58 D5 / D8 part 1; #18 Q5) ──
     //
     // The three-way branching below -- a named label resolves or errors; no label with exactly
@@ -3741,6 +3850,9 @@ impl<'a> ConfigGraph<'a> {
         }
         for c in self.list_ciso_assistant_connectors(company_slug)? {
             out.push(ConnectorConfig::CisoAssistant(c));
+        }
+        for c in self.list_text_mirror_connectors(company_slug)? {
+            out.push(ConnectorConfig::TextMirror(c));
         }
         Ok(out)
     }
