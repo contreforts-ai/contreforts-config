@@ -15,6 +15,27 @@
 //! instead of `contreforts_kg::GraphStore`. This crate depends on `contreforts-core` (shared
 //! vocabulary, D3b) and `contreforts-declaration` (connector-instance SHACL validation, D3a) --
 //! it still does not, and must not, depend on `contreforts-kg`.
+//!
+//! # Three classes of graph, named separately
+//!
+//! contreforts-workspace#18's "new requirement 1" (the config store must be able to import
+//! ontologies) is explicit that the store's graph classes must be *named separately*, because they
+//! have three different write policies -- collapsing any two of them makes one policy silently
+//! govern data it was never argued for:
+//!
+//! 1. [`contreforts_core::namespaces::CONFIG_GRAPH`] -- hand-entered configuration. Written one
+//!    triple at a time through [`ConfigGraph`]'s typed engine, never replaced wholesale
+//!    ([`ConfigStoreError::DestructiveReplaceRefused`]). Not re-derivable by anything.
+//! 2. [`PRODUCT_GRAPH`] -- build-derived declarations. Write-rejected at runtime
+//!    ([`ConfigStoreError::ReservedGraphWrite`]) and rebuilt from the binary's own compiled-in
+//!    Turtle at every startup ([`ConfigStore::reload_product_graph`]).
+//! 3. One named graph per imported ontology, under [`IMPORTED_ONTOLOGY_GRAPH_PREFIX`] --
+//!    operator-supplied vocabulary. Replaced only through [`ConfigGraph::import_ontology`], and
+//!    deliberately **never** rebuilt at startup: no binary carries a copy to rebuild it from, so
+//!    the mechanism that makes class 2 safe would simply destroy class 3.
+//!
+//! See [`IMPORTED_ONTOLOGY_GRAPH_PREFIX`]'s own doc comment for the full table and the reasoning
+//! behind the third row.
 
 pub mod config_graph;
 pub mod error;
@@ -23,11 +44,12 @@ pub mod migration;
 pub use config_graph::{
     AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef,
     CisoAssistantConnectorConfig, CompanyConfig, ConfigGraph, ConnectorConfig,
-    ErpNextConnectorConfig, ForgejoConnectorConfig, GitlabConnectorConfig, KgInstanceConfig,
-    KnowledgeBaseConfig, MatrixConnectorConfig, O365ConnectorAuth, O365ConnectorConfig,
-    PennylaneConnectorConfig, SmtpConnectorConfig, SmtpTlsMode, SparqlTemplateConfig,
-    StalwartConnectorConfig, TextMirrorConnectorConfig, VectorStoreColumnType,
-    VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig, all_connector_kinds,
+    ErpNextConnectorConfig, ForgejoConnectorConfig, GitlabConnectorConfig, ImportedOntologyConfig,
+    KgInstanceConfig, KnowledgeBaseConfig, MatrixConnectorConfig, O365ConnectorAuth,
+    O365ConnectorConfig, OntologyFormat, PennylaneConnectorConfig, SmtpConnectorConfig,
+    SmtpTlsMode, SparqlTemplateConfig, StalwartConnectorConfig, TextMirrorConnectorConfig,
+    VectorStoreColumnType, VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig,
+    all_connector_kinds, imported_ontology_graph_iri,
 };
 pub use migration::{MigrationOutcome, migrate_config_graph_if_needed, verify_config_graph_copy};
 // Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
@@ -41,7 +63,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use oxigraph::io::{RdfFormat, RdfParser};
+use contreforts_core::namespaces::CONFIG_GRAPH;
+use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{GraphName, NamedNode, Quad, Term};
 use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
 use oxigraph::store::{LoaderError, StorageError, Store};
@@ -92,6 +115,39 @@ const CONFIG_STORE_DIR_NAME: &str = "config_store";
 /// Distinct from [`contreforts_core::namespaces::CONFIG_GRAPH`] -- loading this graph must never
 /// mix build-derived declarations into hand-entered configuration data.
 pub const PRODUCT_GRAPH: &str = "https://contreforts.ds-labs.org/data/graph/product";
+
+/// Prefix under which every **imported ontology** gets its own named graph
+/// (contreforts-workspace#18, "New requirement 1 -- config must be able to import ontologies",
+/// added to that issue in the 2026-07-26 design session; #19 D2 is where the requirement
+/// originates, as an *alignment target* for extension terms).
+///
+/// This is the **third** kind of graph living in the config store, and the issue is explicit that
+/// the three must be named separately because they have three different write policies:
+///
+/// | graph | origin | write policy |
+/// |---|---|---|
+/// | [`contreforts_core::namespaces::CONFIG_GRAPH`] | hand-entered by an operator | read-write through the typed engine; never replaced wholesale |
+/// | [`PRODUCT_GRAPH`] | build-derived, compiled into the binary | reserved: write-rejected, and rebuilt from scratch at every startup |
+/// | `{IMPORTED_ONTOLOGY_GRAPH_PREFIX}{label}` | operator-supplied vocabulary | replaced only through [`config_graph::ConfigGraph::import_ontology`]; **never** rebuilt at startup |
+///
+/// The third row is the one this constant exists for, and its "never rebuilt at startup" is the
+/// whole point: an imported ontology is operator-supplied data, not a build artifact. Reloading it
+/// at startup -- the mechanism that makes [`PRODUCT_GRAPH`] safe -- would silently destroy it,
+/// because no binary carries a copy to reload it *from*. It is durable in exactly the sense this
+/// issue exists to create: it survives a KG drop-and-re-sync, because it does not live in the KG
+/// store at all.
+///
+/// One graph per ontology, not one shared graph, so that re-importing or removing one vocabulary
+/// cannot disturb another -- `import_ontology` clears its target graph before loading, and a
+/// shared graph would make that clear destroy every other import.
+///
+/// The trailing slash is load-bearing: the prefix must be a *proper* prefix of every ontology
+/// graph IRI so that `starts_with` is a sound membership test, the same way an instance's
+/// `iri_prefix` is (contreforts-workspace#18: "the per-instance IRI prefix is what makes the guard
+/// decidable"). `tests/imported_ontology.rs` pins that this prefix can never collide with
+/// [`PRODUCT_GRAPH`] or [`contreforts_core::namespaces::CONFIG_GRAPH`].
+pub const IMPORTED_ONTOLOGY_GRAPH_PREFIX: &str =
+    "https://contreforts.ds-labs.org/data/graph/ontology/";
 
 /// Env var used to override the config store's datadir, mirroring
 /// `contreforts-core::GraphConfig`'s `GRAPH_STORE_PATH` but with its own name
@@ -244,6 +300,41 @@ pub enum ConfigStoreError {
          left untouched, so a retry (or manual investigation) can start from a known-good source"
     )]
     ConfigGraphCopyIncomplete { expected: usize, found: usize },
+
+    /// [`ConfigStore::replace_named_graph`] / [`ConfigStore::clear_named_graph`] refused to
+    /// operate on [`contreforts_core::namespaces::CONFIG_GRAPH`]. Both methods *replace* a graph's
+    /// whole contents; pointed at the config graph that is a one-call wipe of every company,
+    /// connector, agent, KB and KG-instance record an operator ever hand-entered -- the single
+    /// most expensive thing this store holds, and the one thing in it that is not re-derivable
+    /// (contreforts-workspace#18's whole premise). Ordinary, triple-at-a-time config writes go
+    /// through [`ConfigStore::insert_quad`] and are unaffected.
+    #[error(
+        "refusing to replace the configuration graph <{graph}> wholesale: it holds \
+         hand-entered, non-regenerable configuration and is only ever written one triple at a \
+         time through the typed config engine"
+    )]
+    DestructiveReplaceRefused { graph: String },
+
+    /// [`ConfigStore::replace_named_graph`] was handed a payload that parsed cleanly but yielded
+    /// zero triples. Refused *before* the target graph is cleared, so an empty (or
+    /// wrong-format-but-still-parseable, e.g. an HTML 404 body fed to the N-Triples parser, which
+    /// yields no triples rather than an error) payload cannot silently destroy a previous import
+    /// and report success. "Absence presenting as success" is this epic's recurring defect; here
+    /// it would be silent data loss.
+    #[error(
+        "refusing to replace <{graph}>: the payload parsed successfully but contains zero \
+         triples -- an empty replacement would destroy the graph's current contents and \
+         report success"
+    )]
+    EmptyGraphPayload { graph: String },
+
+    /// [`ConfigStore::replace_named_graph`] could not parse its payload. Distinct from
+    /// [`Self::ProductGraphLoad`], which can only ever originate from
+    /// [`ConfigStore::reload_product_graph`]'s own compiled-in Turtle: this one is always an
+    /// *operator-supplied* file, so it is a client error (HTTP 400 in `contreforts-config-api`),
+    /// not a server fault.
+    #[error("failed to parse the supplied RDF: {0}")]
+    RdfParse(#[from] RdfParseError),
 }
 
 /// Configuration's own persistent Oxigraph store, wrapping an `Arc<Store>` so
@@ -397,6 +488,115 @@ impl ConfigStore {
         self.store.clear_graph(&graph)?;
         let parser = RdfParser::from_format(RdfFormat::Turtle).with_default_graph(graph);
         self.store.load_from_slice(parser, ttl)?;
+        Ok(())
+    }
+
+    /// Replace `graph`'s entire contents with `data`, parsed as `format`. Returns the number of
+    /// triples the graph holds afterwards.
+    ///
+    /// The write path for an **imported ontology** (contreforts-workspace#18, new requirement 1).
+    /// Refuses [`PRODUCT_GRAPH`] (reserved; [`Self::reload_product_graph`] is its only sanctioned
+    /// writer) and [`contreforts_core::namespaces::CONFIG_GRAPH`] (see
+    /// [`ConfigStoreError::DestructiveReplaceRefused`]).
+    ///
+    /// **Parse first, write second -- deliberately, and at the cost of one in-memory copy of the
+    /// payload.** `Store::load_from_slice` streams straight into the store, so a payload that goes
+    /// malformed halfway through leaves the graph holding whatever prefix parsed, with the
+    /// previous import already cleared. That is acceptable for [`Self::reload_product_graph`],
+    /// whose source is compiled-in and re-loadable on the next restart; it is not acceptable here,
+    /// where the previous contents are operator-supplied and gone for good. Staging into a
+    /// `Vec<Quad>` buys the property that a rejected import changes nothing at all --
+    /// `tests/imported_ontology.rs`'s `a_malformed_payload_leaves_the_previous_import_intact` is
+    /// what holds this in place.
+    ///
+    /// The count returned is read back **from the store**, not taken from `quads.len()`. A payload
+    /// that repeats a triple parses to more quads than the graph ends up holding, and returning
+    /// the parsed count would make every later "does the graph still hold what we imported?" check
+    /// fail forever on such a file.
+    pub fn replace_named_graph(
+        &self,
+        graph: &NamedNode,
+        format: RdfFormat,
+        data: &[u8],
+    ) -> Result<usize, ConfigStoreError> {
+        self.reject_non_replaceable_graph(graph)?;
+
+        // `without_named_graphs` is the load-bearing half of this parser configuration: a
+        // quad-bearing payload (TriG, N-Quads) would otherwise be free to place triples in graphs
+        // the caller never named -- including, given the right file, the very reserved graph the
+        // guard above just refused as a target. Refusing such a file outright is the only answer
+        // that keeps "the guard checks one IRI" sound.
+        let parser = RdfParser::from_format(format)
+            .with_default_graph(GraphName::NamedNode(graph.clone()))
+            .without_named_graphs();
+
+        // `SliceQuadParser`'s item error type is `RdfSyntaxError`, not `RdfParseError`, so this
+        // cannot lean on `?`'s single implicit conversion -- the widening to `RdfParseError` (the
+        // type `ConfigStoreError::RdfParse` carries, chosen to match `oxigraph::io`'s own public
+        // parse error rather than its syntax-only inner half) has to be spelled out.
+        let mut quads: Vec<Quad> = Vec::new();
+        for parsed in parser.for_slice(data) {
+            quads.push(parsed.map_err(RdfParseError::Syntax)?);
+        }
+
+        if quads.is_empty() {
+            return Err(ConfigStoreError::EmptyGraphPayload {
+                graph: graph.as_str().to_string(),
+            });
+        }
+
+        self.store.clear_graph(graph)?;
+        self.store.extend(quads)?;
+        self.named_graph_len(graph)
+    }
+
+    /// Empty `graph`, returning how many triples were removed. Same two refusals as
+    /// [`Self::replace_named_graph`], for the same reasons.
+    ///
+    /// The count is returned rather than discarded so a caller can tell "removed an ontology that
+    /// held 4,102 triples" from "removed a registry record pointing at nothing" -- the second is a
+    /// real, reportable condition (see `ConfigGraph::validate_startup`'s invariant 3), not a
+    /// successful delete.
+    pub fn clear_named_graph(&self, graph: &NamedNode) -> Result<usize, ConfigStoreError> {
+        self.reject_non_replaceable_graph(graph)?;
+        let removed = self.named_graph_len(graph)?;
+        self.store.clear_graph(graph)?;
+        Ok(removed)
+    }
+
+    /// How many triples `graph` currently holds. Counted from the store on every call, never
+    /// cached and never persisted: a stored copy of a derived fact is a fact that can lie, and
+    /// this one would start lying the moment anything wrote the graph outside
+    /// [`Self::replace_named_graph`] -- including the raw SPARQL update route
+    /// (`contreforts-config-api/src/routes/graph.rs`), which is allowed to.
+    pub fn named_graph_len(&self, graph: &NamedNode) -> Result<usize, ConfigStoreError> {
+        let mut count = 0usize;
+        for quad in self
+            .store
+            .quads_for_pattern(None, None, None, Some(graph.into()))
+        {
+            quad?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// The two graphs neither [`Self::replace_named_graph`] nor [`Self::clear_named_graph`] may
+    /// ever target, each with its own named error rather than one shared "not allowed": the
+    /// reserved product graph is refused because it is build-derived and rebuilt at startup, the
+    /// config graph because it is hand-entered and irreplaceable. Collapsing them would tell an
+    /// operator which call failed but not which invariant they hit.
+    fn reject_non_replaceable_graph(&self, graph: &NamedNode) -> Result<(), ConfigStoreError> {
+        if graph.as_str() == PRODUCT_GRAPH {
+            return Err(ConfigStoreError::ReservedGraphWrite {
+                graph: PRODUCT_GRAPH.to_string(),
+            });
+        }
+        if graph.as_str() == CONFIG_GRAPH {
+            return Err(ConfigStoreError::DestructiveReplaceRefused {
+                graph: CONFIG_GRAPH.to_string(),
+            });
+        }
         Ok(())
     }
 }
