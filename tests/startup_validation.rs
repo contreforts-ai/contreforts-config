@@ -15,10 +15,16 @@
 //! `ConfigGraph::validate_startup` does not exist yet, and neither does
 //! `KnowledgeBaseConfig::kg_instance_label` -- this file does not compile against `develop`.
 //! Sanctioned compile-error RED, same as this crate's other new D5/D6 files.
+//!
+//! The last section (contreforts/contreforts-kg#10) is the one exception to the framing above:
+//! invariant 4 refuses a state no write path was ever meant to prevent, reachable by performing
+//! the ordinary create-then-link provisioning of a text-mirror connector and stopping after the
+//! first step. No `ConfigStore::inner()` corruption is needed to reach it, and the pairing rule
+//! still holds -- every rejection there has its own bound-and-accepted control.
 
 use contreforts_config::{
     AgentConfig, CompanyConfig, ConfigGraph, ConfigStore, ForgejoConnectorConfig, KgInstanceConfig,
-    KnowledgeBaseConfig,
+    KnowledgeBaseConfig, TextMirrorConnectorConfig,
 };
 use contreforts_core::namespaces::{CONFIG_GRAPH, CORE_NS};
 use contreforts_declaration::ConnectorDeclarations;
@@ -437,5 +443,227 @@ fn a_none_labelled_kb_is_no_longer_exempt_at_startup_once_an_instance_is_registe
     assert!(
         combined.contains("legacy"),
         "the report must name the offending KB, got: {combined:?}"
+    );
+}
+
+// ── contreforts/contreforts-kg#10 (decision recorded 2026-08-11): a text-mirror connector must
+// name the knowledge base whose corpus it mirrors ────────────────────────────────────────────
+//
+// A text mirror is one knowledge base's corpus in lexical form, and `TextMirrorConnectorConfig`
+// carries no ACL field of its own, deliberately -- its perimeter *is* the knowledge base it is
+// linked to. So a mirror linked to nothing has no perimeter at all.
+//
+// The link is a separate write from the connector (`set_connector_target_kb`, generic over the
+// kind, not a struct field), so "created but never linked" is reachable through the ordinary
+// create-then-link provisioning path -- unlike this file's other cases, which need the raw
+// SPARQL update route to reach. #10 rejected requiring the link at connector write time (it
+// would invert that order for every consumer of the framework) and rejected reporting it as a
+// state (a third-party operator has no reason to consult a field they do not know exists), and
+// chose `validate_startup`, where the other cross-connector invariants already live.
+//
+// The trap these tests exist to pin, named in the decision itself: the requirement is
+// **conditional on the connector existing**. A deployment with no text-mirror connector must
+// still start.
+
+/// The mirror's own bounds are `sh:minCount 1` in the declaration and irrelevant to this guard;
+/// the values here are the Python tool's measured defaults (#10's opening comment) so they read
+/// as a plausible deployment rather than as placeholders.
+fn mirror(label: &str) -> TextMirrorConnectorConfig {
+    TextMirrorConnectorConfig {
+        label: label.to_string(),
+        mirror_root: format!("/var/lib/contreforts/mirrors/{label}"),
+        max_documents: 120,
+        max_excerpts_per_document: 3,
+    }
+}
+
+/// Registers one clean, instance-associated KB for a mirror to be bound to. Its `graph` falls
+/// under `PRIMARY_PREFIX` so invariant 1 stays silent and these tests only ever observe
+/// invariant 4.
+fn register_kb(cg: &ConfigGraph<'_>, label: &str) {
+    cg.set_knowledge_base(
+        "acme",
+        &KnowledgeBaseConfig {
+            label: label.to_string(),
+            kg_instance_label: Some("primary".to_string()),
+            graph: Some(format!("{PRIMARY_PREFIX}entity/{label}")),
+            vector_store_label: "vs".to_string(),
+        },
+    )
+    .expect("registering a clean KB succeeds");
+}
+
+/// A text-mirror connector written and never linked -- the exact state
+/// `set_text_mirror_connector` leaves behind on its own, with no corruption and no raw SPARQL
+/// involved. Startup must refuse it, and the report must name the connector: whoever reads it is
+/// operating a deployment they may not have configured, so "a connector is misconfigured" would
+/// be useless to them.
+#[test]
+fn validate_startup_refuses_a_text_mirror_connector_that_names_no_knowledge_base() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+    register_kb(&cg, "support");
+
+    cg.set_text_mirror_connector("acme", &mirror("support-corpus"))
+        .expect("writing a text-mirror connector succeeds -- the write itself is not the guard");
+    // Deliberately no `set_connector_target_kb`: that omission is the whole test.
+
+    let violations = cg.validate_startup().expect_err(
+        "a text-mirror connector bound to no knowledge base has no perimeter at all, and \
+         contreforts/contreforts-kg#10 decided a deployment that leaves one unbound must refuse \
+         to start -- got Ok(())",
+    );
+    let combined = violations.join("\n");
+    assert!(
+        combined.contains("support-corpus"),
+        "the report must name the offending connector -- an operator who did not write this \
+         configuration cannot find it otherwise, got: {combined:?}"
+    );
+    assert!(
+        combined.contains("acme"),
+        "the report must name the company the connector belongs to, since labels are only \
+         unique within one, got: {combined:?}"
+    );
+    assert!(
+        combined.contains("set_connector_target_kb"),
+        "the report must say what to do about it, not only that something is wrong -- the \
+         remediation is the link this connector is missing, got: {combined:?}"
+    );
+}
+
+/// The control for the test above: the same connector, linked. Without this, a guard that simply
+/// rejected every text-mirror connector -- or every store containing one -- would pass the
+/// rejection test for entirely the wrong reason, and the legitimate configuration this issue
+/// exists to make mandatory would be unstartable.
+#[test]
+fn validate_startup_accepts_a_text_mirror_connector_bound_to_a_knowledge_base() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+    register_kb(&cg, "support");
+
+    cg.set_text_mirror_connector("acme", &mirror("support-corpus"))
+        .expect("writing a text-mirror connector succeeds");
+    cg.set_connector_target_kb("acme", "text-mirror", Some("support-corpus"), "support")
+        .expect("linking the mirror to the KB whose corpus it mirrors succeeds");
+
+    let result = cg.validate_startup();
+    assert!(
+        result.is_ok(),
+        "a text-mirror connector that names its knowledge base is exactly the configuration \
+         contreforts/contreforts-kg#10 requires -- it must start, got: {result:?}"
+    );
+}
+
+/// The easy one to get wrong. #10's requirement is conditional on the connector existing: a
+/// deployment that uses no text mirror at all is complete, not incomplete. Turning invariant 4
+/// into "every company must have a bound mirror" would refuse to start every deployment that
+/// does not use `kb_grep`.
+///
+/// The company here also holds an *unbound connector of another kind*, which is legitimate --
+/// only a text mirror has no boundary of its own -- so this test additionally fails if the guard
+/// is widened from `TEXT_MIRROR` to `ALL_CONNECTOR_DESCRIPTORS`.
+#[test]
+fn validate_startup_accepts_a_deployment_with_no_text_mirror_connector_at_all() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+    register_kb(&cg, "support");
+
+    cg.set_forgejo_connector(
+        "acme",
+        &ForgejoConnectorConfig {
+            label: "main".to_string(),
+            url: "https://git.example.com".to_string(),
+            token: "tok".to_string(),
+        },
+    )
+    .expect("connector registers cleanly");
+    // No target-KB link on it, and no text-mirror connector anywhere in the store.
+
+    let result = cg.validate_startup();
+    assert!(
+        result.is_ok(),
+        "the requirement is conditional on a text-mirror connector existing -- a deployment \
+         holding none must still start, and an unbound connector of another kind is not this \
+         invariant's business, got: {result:?}"
+    );
+}
+
+/// `validate_startup` reports every violation it finds rather than the first, so a single
+/// corrupted store surfaces its whole problem in one restart. Two unbound mirrors must both be
+/// named -- and the bound third one must not be, which is what fails if the guard stops
+/// examining targets and flags every mirror it sees.
+#[test]
+fn validate_startup_reports_every_unbound_text_mirror_and_only_those() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+    register_kb(&cg, "support");
+
+    for label in ["hr-corpus", "legal-corpus", "support-corpus"] {
+        cg.set_text_mirror_connector("acme", &mirror(label))
+            .expect("writing a text-mirror connector succeeds");
+    }
+    cg.set_connector_target_kb("acme", "text-mirror", Some("support-corpus"), "support")
+        .expect("linking one of the three succeeds");
+
+    let violations = cg
+        .validate_startup()
+        .expect_err("two of the three mirrors name no knowledge base -- got Ok(())");
+    let combined = violations.join("\n");
+    assert!(
+        combined.contains("hr-corpus"),
+        "the first unbound mirror must be named, got: {combined:?}"
+    );
+    assert!(
+        combined.contains("legal-corpus"),
+        "the second unbound mirror must be named too -- reporting only the first would cost one \
+         restart per misconfigured connector, which is not how this pass reports its other \
+         invariants, got: {combined:?}"
+    );
+    assert!(
+        !combined.contains("support-corpus"),
+        "the bound mirror must not be reported -- a guard that flags every mirror regardless of \
+         its target would pass this file's rejection test for the wrong reason, got: {combined:?}"
+    );
+}
+
+/// A `targetKnowledgeBase` literal set to the empty string names a knowledge base no more than
+/// an absent one does. Reachable through the unrestricted raw SPARQL update route this whole
+/// file exists for -- and, as it happens, through `set_connector_target_kb` itself, which
+/// validates the value against registered KB *graphs* (D5's second invariant) but not against
+/// emptiness. Treating it as bound would make an empty string the one way past this guard.
+#[test]
+fn validate_startup_treats_a_blank_target_knowledge_base_on_a_mirror_as_unbound() {
+    let (_dir, store) = store();
+    let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
+    setup(&cg);
+    register_kb(&cg, "support");
+
+    cg.set_text_mirror_connector("acme", &mirror("support-corpus"))
+        .expect("writing a text-mirror connector succeeds");
+    cg.set_connector_target_kb("acme", "text-mirror", Some("support-corpus"), "   ")
+        .expect("a blank target is accepted at write time -- nothing there checks emptiness");
+
+    // Sanity: the link really was stored, so this test is exercising the blank-value branch and
+    // not merely the absent-link one the test above already covers.
+    let stored = cg
+        .get_connector_target_kb("acme", "text-mirror", Some("support-corpus"))
+        .expect("reading the link back succeeds");
+    assert_eq!(
+        stored.as_deref(),
+        Some("   "),
+        "sanity check: the blank link must actually be in the store"
+    );
+
+    let violations = cg
+        .validate_startup()
+        .expect_err("a blank target knowledge base names nothing -- got Ok(())");
+    let combined = violations.join("\n");
+    assert!(
+        combined.contains("support-corpus"),
+        "the report must name the connector whose target is blank, got: {combined:?}"
     );
 }

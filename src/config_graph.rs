@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use contreforts_core::namespaces::{self, CONFIG_GRAPH, CORE_NS, RDF};
 use contreforts_declaration::{
-    ConnectorDeclarations, ConnectorIris, ConnectorValidator, VariantRule,
+    ConnectorDeclarations, ConnectorIris, ConnectorValidator, VariantRule, WriteIntent,
 };
 
 use crate::error::{ConfigGraphError, Result};
@@ -228,16 +228,6 @@ pub struct StalwartConnectorConfig {
     pub customer: Option<String>,
 }
 
-/// Configuration for the Visio generator service (Element Call + Kutt),
-/// multi-instance, label-scoped, optionally narrowed to one customer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextMirrorConnectorConfig {
-    pub label: String,
-    pub mirror_root: String,
-    pub max_documents: u32,
-    pub max_excerpts_per_document: u32,
-}
-
 /// A flat text mirror of the document corpus, the backend `kb_grep` had none of.
 ///
 /// contreforts/contreforts-kg#10. Four stored fields, matching
@@ -248,11 +238,16 @@ pub struct TextMirrorConnectorConfig {
 /// as plain text. The boundary is the filesystem and the one-binary-one-corpus process that
 /// reads it — one mirror per perimeter. A field on this struct would look like a boundary and
 /// hold nothing, which is worse than its absence.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CisoAssistantConnectorConfig {
+///
+/// A mirror that names no knowledge base belongs to no perimeter at all, which is the one
+/// reachable bad state; `validate_startup` refuses it rather than a write path, because the
+/// connector and its binding are written in two separate calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMirrorConnectorConfig {
     pub label: String,
-    pub url: String,
-    pub token: String,
+    pub mirror_root: String,
+    pub max_documents: u32,
+    pub max_excerpts_per_document: u32,
 }
 
 /// A CISO Assistant instance (intuitem), the GRC source behind the RSSI assistant.
@@ -266,6 +261,15 @@ pub struct CisoAssistantConnectorConfig {
 /// running server: `GET /product-graph/forms/ciso-assistant` served a complete form while
 /// `PUT /connector-values/ciso-assistant/main` answered `400 unknown connector kind`. An
 /// operator could fill in a connector that could not be saved.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CisoAssistantConnectorConfig {
+    pub label: String,
+    pub url: String,
+    pub token: String,
+}
+
+/// Configuration for the Visio generator service (Element Call + Kutt),
+/// multi-instance, label-scoped, optionally narrowed to one customer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisioConnectorConfig {
     pub label: String,
@@ -1380,8 +1384,49 @@ impl<'a> ConfigGraph<'a> {
         self.reject_kb_graph_reference(fields.iter().filter_map(|(_, v)| *v))?;
 
         if let Some(validator) = self.validator {
+            // D8's create-versus-update asymmetry (contreforts-workspace#19, amended 2026-08-11).
+            //
+            // A required secret is required when a connector is **created** and
+            // absent-means-unchanged when it is **updated** — the API never serves a secret back,
+            // so a form submitting nothing for it is submitting "unchanged", not "clear". One
+            // SHACL shape cannot say both, so the declaration carries two and the caller must
+            // name which it means. `WriteIntent` has no default, deliberately: a caller that
+            // forgot would silently get the permissive one, which is the failure this whole
+            // mechanism exists to prevent.
+            //
+            // This engine decides it from the store rather than taking it as a parameter,
+            // because `write_connector` is the body of all eleven `set_*_connector` methods and
+            // of the generic route, and every one of them is a blind upsert — none of their
+            // callers knows, or should have to know, whether the connector already exists.
+            // Reading it here means the two cannot disagree.
+            //
+            // The probe is `rdf:type` specifically, not "any triple on the subject". The
+            // connector subject can carry `{CORE_NS}targetKnowledgeBase` written by
+            // `set_connector_target_kb` before any `set_*_connector` call — see the delete-window
+            // comment below for why that predicate lives outside this engine's write window. A
+            // whole-subject probe would read a connector that exists only as a KB link as
+            // already created, and validate its first real write under the permissive shape.
+            let rdf_type_node = self.node(&format!("{RDF}type"))?;
+            let already_exists = self
+                .store
+                .inner()
+                .quads_for_pattern(
+                    Some((&conn_node).into()),
+                    Some((&rdf_type_node).into()),
+                    None,
+                    Some((&self.graph).into()),
+                )
+                .next()
+                .transpose()?
+                .is_some();
+            let intent = if already_exists {
+                WriteIntent::Update
+            } else {
+                WriteIntent::Create
+            };
+
             let instance = self.connector_instance_graph(&conn_iri, &type_iri, &resolved_fields)?;
-            if let Err(violations) = validator.validate(&type_iri, &instance) {
+            if let Err(violations) = validator.validate(intent, &type_iri, &instance) {
                 let lines: Vec<String> = violations
                     .iter()
                     .enumerate()
@@ -3860,11 +3905,17 @@ impl<'a> ConfigGraph<'a> {
     // is still caught -- later than write time, but not never.
 
     /// Re-check both of D5's invariants -- and, since contreforts-workspace#18's new requirement
-    /// 1, invariant 3 on imported ontologies -- against the store's actual contents, independent
+    /// 1, invariant 3 on imported ontologies, and since contreforts/contreforts-kg#10, invariant
+    /// 4 on text-mirror connectors -- against the store's actual contents, independent
     /// of whichever write path (if any) put them there. Returns every violation found, each naming
     /// the offending record, the offending value, and the rule violated -- not merely the first
     /// one, so a single corrupted store surfaces its whole problem at once rather than one
     /// restart at a time.
+    ///
+    /// Invariants 1-3 exist because a write-time guard is bypassable; invariant 4 is different in
+    /// kind -- nothing bypasses anything, the state it refuses is reachable through the ordinary
+    /// create-then-link provisioning path by simply not performing the second step. See its own
+    /// comment below for why it lives here rather than in `set_text_mirror_connector`.
     ///
     /// Meant to be called once at process startup, alongside [`crate::ConfigStore::reload_product_graph`]
     /// (D6's own startup pass) -- see that method's doc comment for why a startup pass is what
@@ -4064,6 +4115,95 @@ impl<'a> ConfigGraph<'a> {
                             ontology.label, ontology.graph
                         ));
                     }
+                }
+            }
+        }
+
+        // Invariant 4 (contreforts/contreforts-kg#10, decision recorded 2026-08-11): every
+        // text-mirror connector must name the knowledge base whose corpus it mirrors. A mirror is
+        // the same documents as a vector store in another form -- `kb_grep` over a flat text tree
+        // -- and it carries no ACL field of its own, deliberately (see
+        // `TextMirrorConnectorConfig`): its perimeter *is* the knowledge base it is linked to. A
+        // mirror linked to nothing is therefore a lexical view of a corpus with none of the
+        // boundary the ANN view of the same corpus has.
+        //
+        // Conditional on the connector existing, deliberately: a deployment holding no text-mirror
+        // connector at all is complete, not incomplete. The rule is "if you have one, it is
+        // bound", never "you must have one" -- getting that wrong would refuse to start every
+        // deployment that does not use `kb_grep`.
+        //
+        // #10 weighed three placements before choosing this one:
+        //   * Require the link in `set_text_mirror_connector`. Rejected: it would force the KB to
+        //     be named before the connector exists, inverting the create-then-link order the link
+        //     is built around -- `set_connector_target_kb` is a separate call by construction, and
+        //     `write_connector` above goes out of its way to preserve `targetKnowledgeBase` across
+        //     a re-save precisely because the two writes are independent. contreforts is a
+        //     framework a third party builds their own ERP on; this would restructure their
+        //     provisioning flow to satisfy an invariant they did not choose.
+        //   * Leave it optional and report an unbound mirror as a state, the way an absent
+        //     `admin_url` is reported as "not provisionable". Rejected: it lets a deployment run
+        //     mis-configured indefinitely, and an operator who did not write the configuration has
+        //     no reason to consult a field they do not know exists.
+        //   * Here, where D5's cross-connector invariants already live and already walk every
+        //     descriptor: the misconfiguration fails at startup, loudly, naming the connector --
+        //     the kindest failure available to someone operating a deployment they did not write.
+        //
+        // What this deliberately does *not* check: whether a mirror's KB and the vector store's KB
+        // agree. #10 was filed for exactly that hazard, and it turned out to be structurally
+        // inexpressible -- a mirror names a knowledge base, and a `KnowledgeBaseConfig` names
+        // exactly one `vector_store_label`, so given the mirror's KB the store is determined and
+        // there is no second place for the two to disagree. Dangling and duplicate references are
+        // not checked here either, for the opposite reason: `find_connector_targeting_kb` walks
+        // `ALL_CONNECTOR_DESCRIPTORS`, which contains `TEXT_MIRROR`, so text-mirror is already
+        // inside D5's existing guards for those. The gap this closes is only "no reference at
+        // all", which is the one reachable bad state left.
+        for company in &companies {
+            let labels = match self.list_connector_labels(&company.slug, &TEXT_MIRROR) {
+                Ok(labels) => labels,
+                Err(e) => {
+                    violations.push(format!(
+                        "failed to list text-mirror connectors for company '{}': {e}",
+                        company.slug
+                    ));
+                    continue;
+                }
+            };
+            for label in labels {
+                let target = match self.get_connector_target_kb(
+                    &company.slug,
+                    TEXT_MIRROR.kind,
+                    Some(&label),
+                ) {
+                    Ok(target) => target,
+                    Err(e) => {
+                        violations.push(format!(
+                            "failed to read the target knowledge base of text-mirror connector \
+                             '{label}' (company '{}'): {e}",
+                            company.slug
+                        ));
+                        continue;
+                    }
+                };
+                // A blank label counts as unbound rather than as a dangling reference. It names
+                // no knowledge base any more than `None` does, and the raw SPARQL update route
+                // invariants 1-3 exist for can write one; treating it as "bound" here would make
+                // an empty string the one way past this guard.
+                let bound = target.as_deref().is_some_and(|kb| !kb.trim().is_empty());
+                if !bound {
+                    violations.push(format!(
+                        "text-mirror connector '{label}' (company '{}') names no knowledge base \
+                         -- a text mirror is one knowledge base's corpus in lexical form and has \
+                         no access boundary of its own, so an unbound mirror exposes documents to \
+                         `kb_grep` that the knowledge base's own perimeter would restrict. Link it \
+                         to the knowledge base whose corpus it mirrors, then start again: \
+                         `set_connector_target_kb(\"{}\", \"{}\", Some(\"{label}\"), \
+                         \"<knowledge base label>\")` -- the same `core:targetKnowledgeBase` link \
+                         every other connector kind carries. The connector is written and linked \
+                         in two separate steps, so a mirror created but never linked reaches this \
+                         state through the ordinary provisioning path. If the mirror is not in \
+                         use, delete the connector instead",
+                        company.slug, company.slug, TEXT_MIRROR.kind
+                    ));
                 }
             }
         }
