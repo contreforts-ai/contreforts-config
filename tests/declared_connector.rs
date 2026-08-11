@@ -472,15 +472,71 @@ fn set_forgejo_connector_preserves_the_target_kb_link() {
     );
 }
 
-/// The deliberate scope limit, pinned so it is a decision rather than an accident: change A
-/// narrows the delete window **only** for a kind whose namespace resolves to
-/// `ConnectorNamespace::Declared`. A `Core` kind has no declared field set to narrow to, so its
-/// write keeps wiping the whole subject — and therefore still destroys a target-KB link.
+/// **An undeclared kind keeps its target-KB link across a re-save** (#13).
 ///
-/// If a later change extends the narrowing to `Core` kinds, this test fails and the extension
-/// is a reviewed event rather than a silent behaviour change.
+/// This test used to pin the opposite, as W6's deliberate scope limit: change A narrowed the
+/// delete window only for `ConnectorNamespace::Declared`, a `Core` kind had no field set to
+/// narrow *to*, and so its write went on wiping the whole subject. The old assertion said, in
+/// as many words, *"that may be desirable, but it is a behaviour change that must be reviewed,
+/// not inherited"*.
+///
+/// `contreforts-config#13` is that review. The consequence it records is why the answer is
+/// yes: D5's KB-delete guard keys on `core:targetKnowledgeBase`, so the four kinds in
+/// `UNDECLARED_CONNECTOR_KINDS` were making their knowledge base silently deletable every time
+/// somebody re-saved them — through a call nobody thinks of as a write to the KB graph.
+///
+/// The fix does **not** extend the field-list narrowing to `Core` kinds; there is still no
+/// list to narrow to. It inverts the question: the wipe is still whole-subject, minus the
+/// predicates this engine does not own. `write_connector` does not have to know everything it
+/// writes, only what it must not destroy — a list that is short, identical for every kind, and
+/// does not grow when a connector does.
+/// …and the wipe still happens for everything the engine **does** own.
+///
+/// The other half, and the one that would be missing if only the link were asserted: a
+/// `remove_subject_from_named_graph_except` that kept everything would make re-saving an
+/// undeclared kind accumulate stale field values instead of replacing them — which is a
+/// worse defect than the one #13 fixes, and invisible to a test that only counts the
+/// preserved predicate.
 #[test]
-fn an_undeclared_kind_still_wipes_the_whole_subject() {
+fn an_undeclared_kind_still_replaces_its_own_fields_rather_than_accumulating_them() {
+    let (_dir, store) = store();
+    add_company(&store, "acme");
+    let ttl = forgejo_only_ttl();
+    let validator = validator_for(&ttl);
+    let cg = ConfigGraph::with_validator(&store, validator.declarations(), &validator);
+
+    let config = contreforts_config::GitlabConnectorConfig {
+        label: "main".to_string(),
+        url: "https://gitlab.example.com".to_string(),
+        token: "t0".to_string(),
+    };
+    cg.set_gitlab_connector("acme", &config)
+        .expect("gitlab connector stores");
+    cg.set_gitlab_connector(
+        "acme",
+        &contreforts_config::GitlabConnectorConfig {
+            token: "t1".to_string(),
+            ..config
+        },
+    )
+    .expect("re-saving succeeds");
+
+    let conn_iri = namespaces::connector_iri("gitlab", "acme", Some("main"));
+    let stored = stored_triples(&store, &conn_iri);
+    let tokens: Vec<&(String, String)> = stored
+        .iter()
+        .filter(|(p, _)| p.ends_with("token"))
+        .collect();
+    assert_eq!(
+        tokens.len(),
+        1,
+        "the old token must be gone, not sitting beside the new one: {stored:?}"
+    );
+    assert_eq!(tokens[0].1, "t1", "and it is the new value: {stored:?}");
+}
+
+#[test]
+fn an_undeclared_kind_keeps_the_link_it_does_not_own() {
     let (_dir, store) = store();
     add_company(&store, "acme");
     // forgejo declared, gitlab NOT -- so gitlab resolves to `Core`.
@@ -513,11 +569,10 @@ fn an_undeclared_kind_still_wipes_the_whole_subject() {
 
     assert_eq!(
         triple_count(&store, &conn_iri, &target_pred),
-        0,
-        "an undeclared (`ConnectorNamespace::Core`) kind is expected to keep today's \
-         whole-subject wipe -- it has no declared field set to narrow the delete window to. \
-         A non-zero count here means the narrowing was extended to `Core` kinds; that may be \
-         desirable, but it is a behaviour change that must be reviewed, not inherited."
+        1,
+        "re-saving an undeclared kind must not destroy `core:targetKnowledgeBase`: it is \
+         written by `set_connector_target_kb`, not by `write_connector`, and D5's KB-delete \
+         guard keys on it -- so losing it makes the knowledge base silently deletable"
     );
 }
 
