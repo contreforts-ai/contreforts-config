@@ -1056,6 +1056,40 @@ fn remove_subject_from_named_graph(
     Ok(())
 }
 
+/// `remove_subject_from_named_graph` with a set of predicates **held back**.
+///
+/// The counterpart of [`remove_subject_predicate_from_named_graph`], and the shape a
+/// `ConnectorNamespace::Core` kind needs (#13). That kind has no declared field set, so
+/// there is no list to narrow the delete window *to* — which is why the whole-subject wipe
+/// survived W6 and why the four undeclared kinds went on losing their
+/// `{CORE_NS}targetKnowledgeBase` on every re-save.
+///
+/// Inverting the question answers it: `write_connector` does not need to know every
+/// predicate it writes, only every predicate it does **not own**. That list is short, it is
+/// the same for every kind, and it does not grow when a connector does.
+///
+/// Stated as a rule rather than a special case: **the idempotence wipe may not destroy a
+/// triple this engine did not write.** `targetKnowledgeBase` is written by
+/// `set_connector_target_kb` and by nothing here.
+fn remove_subject_from_named_graph_except(
+    store: &ConfigStore,
+    subject: &NamedNode,
+    graph: &NamedNode,
+    keep: &[&NamedNode],
+) -> Result<()> {
+    let quads: Vec<_> = store
+        .inner()
+        .quads_for_pattern(Some(subject.into()), None, None, Some(graph.into()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for quad in quads {
+        if keep.iter().any(|p| quad.predicate.as_str() == p.as_str()) {
+            continue;
+        }
+        store.inner().remove(&quad)?;
+    }
+    Ok(())
+}
+
 /// `remove_subject_from_named_graph` narrowed by one predicate -- the same
 /// `quads_for_pattern` + `remove` loop with the predicate slot bound instead of wildcarded.
 ///
@@ -1358,7 +1392,23 @@ impl<'a> ConfigGraph<'a> {
                 }
             }
             ConnectorNamespace::Core => {
-                remove_subject_from_named_graph(self.store, &conn_node, &self.graph)?;
+                // Still a whole-subject wipe -- an undeclared kind has no field set to
+                // narrow *to*, which is why W6 left it alone -- but no longer a wipe of
+                // triples this engine does not own (#13).
+                //
+                // The four kinds in `UNDECLARED_CONNECTOR_KINDS` (`matrix`, `smtp`,
+                // `vector_store`, `visio`) were losing `targetKnowledgeBase` on every
+                // re-save through their typed `set_*_connector`, and D5's KB-delete guard
+                // keys on exactly that link -- so the knowledge base silently became
+                // deletable, and a save nobody thought of as a write to the KB graph was
+                // what unlocked it.
+                let target_kb = self.node(&format!("{CORE_NS}targetKnowledgeBase"))?;
+                remove_subject_from_named_graph_except(
+                    self.store,
+                    &conn_node,
+                    &self.graph,
+                    &[&target_kb],
+                )?;
             }
         }
 
