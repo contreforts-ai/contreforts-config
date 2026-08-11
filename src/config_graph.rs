@@ -278,6 +278,15 @@ pub struct VisioConnectorConfig {
 pub enum VectorStoreKind {
     Pgvector,
     InMemory,
+    /// A Chroma collection, read-only — `contreforts-vecdb#7`.
+    ///
+    /// Carries [`VectorStoreConnectorConfig::url`] (the server root),
+    /// [`VectorStoreConnectorConfig::collection`] and
+    /// [`VectorStoreConnectorConfig::credential_ref`]. `table`, `dimension` and
+    /// `column_type` are pgvector's and mean nothing here: the collection's
+    /// geometry is fixed by whoever wrote it, and this backend cannot create
+    /// one.
+    Chroma,
 }
 
 /// The pgvector column type an embedding is stored in — the other half of a
@@ -352,10 +361,55 @@ fn parse_vector_store_column_type(raw: Option<&str>) -> VectorStoreColumnType {
 pub struct VectorStoreConnectorConfig {
     pub label: String,
     pub kind: VectorStoreKind,
-    /// PostgreSQL URL (required when kind=Pgvector, ignored otherwise).
+    /// Where the store is: the PostgreSQL URL when `kind=Pgvector`, the Chroma
+    /// server root when `kind=Chroma`. Ignored for `InMemory`. Required for
+    /// both of the others, and checked at write time.
     pub url: Option<String>,
     /// Optional table name (Pgvector only; default "rag_chunks").
     pub table: Option<String>,
+    /// The Chroma collection to read (Chroma only). Required there, and
+    /// checked at write time.
+    ///
+    /// **Its own field rather than a reuse of `table`**, which is
+    /// `contreforts-kg#9`'s decision and the right one. A collection is not a
+    /// table: `table` is interpolated into SQL and is therefore held to a plain
+    /// SQL identifier (`contreforts-vecdb#18`), where a collection name allows
+    /// hyphens and is bounded at 63 characters and is interpolated into
+    /// nothing. One field carrying two validation regimes means tightening it
+    /// for one backend silently narrows the other — and a field whose meaning
+    /// depends on a sibling enum is what gets mis-set in a generated form.
+    ///
+    /// `contreforts-vecdb`'s `VectorStoreSpec` now agrees, having first tried
+    /// the reuse: it carries `collection` beside `table` for these reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    /// **The name of the secret to inject, never the secret.** Chroma only.
+    ///
+    /// `contreforts-vecdb#8` settled this: `StoreCredentials` is resolved by
+    /// the process at startup and never read from the configuration graph,
+    /// because the graph is queryable, dumpable and backed up. What the graph
+    /// may hold is a *lookup key* — which environment variable the process
+    /// should read the token out of. `traktion-cli bootstrap` is the
+    /// precedent.
+    ///
+    /// So this field is **not** `contreforts:secret` and is deliberately read
+    /// back like any other field: it carries nothing worth eliding, and eliding
+    /// it would stop an operator seeing which variable a store is waiting on.
+    /// That is the whole difference between this and
+    /// [`VectorStoreConnectorConfig::admin_url`], which is a credential and is
+    /// write-only.
+    ///
+    /// Held to the shape of an environment variable name at write time — see
+    /// `validate_vector_store_credential_ref`, including why that is a guard
+    /// and not merely a format check.
+    ///
+    /// `None` means the collection is reachable without a token. On the
+    /// restricted collections that is wrong and the connection fails closed:
+    /// `build_vector_store` refuses to reach a store unauthenticated when the
+    /// caller declared credentials, and here the absence simply means none were
+    /// declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
     /// Embedding dimension. Load-bearing since contreforts-kg#8: validated
     /// against `column_type` when this connector is written, so an unindexable
     /// pair is refused at save time rather than surfacing months later as "the
@@ -400,6 +454,81 @@ pub struct VectorStoreConnectorConfig {
 ///
 /// `InMemory` stores have no pgvector column, so the pair is not theirs to
 /// satisfy and is not checked.
+/// Refuse a Chroma store that cannot be built from what was stored.
+///
+/// `contreforts-kg#9`'s last bullet: *"a `Chroma` connector without a
+/// collection is refused when saved, not diagnosed at first query"*. The two
+/// moments are not equivalent — at save time there is an operator present to be
+/// told, and at query time there is an assistant returning nothing.
+///
+/// Both fields are checked because `contreforts-vecdb::build_vector_store`
+/// requires both, and a stored connector that cannot be built is a connector
+/// that reads as configured and is not.
+fn validate_chroma_fields(config: &VectorStoreConnectorConfig) -> Result<()> {
+    let missing = |what: &str, why: &str| {
+        Err(ConfigGraphError::ConnectorValidation(format!(
+            "vector store '{}': a chroma store requires {what} -- {why}",
+            config.label
+        )))
+    };
+    if config.url.as_deref().unwrap_or("").trim().is_empty() {
+        return missing(
+            "a url",
+            "it is the Chroma server root, e.g. https://kb.example:8000",
+        );
+    }
+    if config.collection.as_deref().unwrap_or("").trim().is_empty() {
+        return missing(
+            "a collection",
+            "a server holds many and none of them is a default worth guessing. It is a \
+             field of its own and not `table`, which is the pgvector table name",
+        );
+    }
+    validate_vector_store_credential_ref(config)
+}
+
+/// Refuse a `credential_ref` that is not the shape of an environment variable
+/// name.
+///
+/// **This is a guard, not a format check.** The field exists so the graph holds
+/// the *name* of a secret and never the secret — `contreforts-vecdb#8`, because
+/// the configuration graph is queryable, dumpable and backed up. Nothing can
+/// prove a given string is not a token, but requiring `[A-Z_][A-Z0-9_]*`
+/// excludes the shapes a pasted credential actually takes: lowercase hex, mixed
+/// case, base64 with `+`, `/` and `=`, and anything containing a `-` or a `.`.
+/// An operator who pastes the token instead of the variable name is told so
+/// immediately, which is the failure worth catching — the value would otherwise
+/// sit in the graph indefinitely, looking like configuration.
+///
+/// It is also the *only* shape that resolves today: an environment variable is
+/// what the process reads at startup. Accepting a secret-store path would store
+/// a reference nothing looks up, which reads as configured and is not — the
+/// same failure this function exists to prevent, one layer along. Widen the
+/// rule deliberately when a secret store arrives, rather than pre-emptively.
+fn validate_vector_store_credential_ref(config: &VectorStoreConnectorConfig) -> Result<()> {
+    let Some(reference) = config.credential_ref.as_deref() else {
+        return Ok(());
+    };
+    let plausible = {
+        let mut chars = reference.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    };
+    if plausible {
+        return Ok(());
+    }
+    Err(ConfigGraphError::ConnectorValidation(format!(
+        "vector store '{}': credential_ref {reference:?} is not the name of an environment \
+         variable (`[A-Z_][A-Z0-9_]*`). This field holds the NAME of the secret to inject, \
+         never the secret itself -- the configuration graph is queryable, dumpable and \
+         backed up (contreforts-vecdb#8). If you pasted the token, put it in the process's \
+         environment and name the variable here instead.",
+        config.label
+    )))
+}
+
 fn validate_vector_store_geometry(config: &VectorStoreConnectorConfig) -> Result<()> {
     if config.kind != VectorStoreKind::Pgvector {
         return Ok(());
@@ -2233,9 +2362,15 @@ impl<'a> ConfigGraph<'a> {
         let kind_str = match config.kind {
             VectorStoreKind::Pgvector => "pgvector",
             VectorStoreKind::InMemory => "in_memory",
+            VectorStoreKind::Chroma => "chroma",
         };
         // contreforts-kg#8: before anything is written, not after.
         validate_vector_store_geometry(config)?;
+        // contreforts-kg#9, same principle: at save time there is an operator
+        // present to be told, at query time there is only an empty answer.
+        if config.kind == VectorStoreKind::Chroma {
+            validate_chroma_fields(config)?;
+        }
         let dimension_str = config.dimension.to_string();
         self.write_connector(
             company_slug,
@@ -2248,6 +2383,13 @@ impl<'a> ConfigGraph<'a> {
                 ("tableName", config.table.as_deref()),
                 ("dimension", Some(dimension_str.as_str())),
                 ("columnType", Some(config.column_type.as_str())),
+                // Chroma's two (contreforts-kg#9). `None` skips the triple, so
+                // a pgvector store stores neither.
+                ("collectionName", config.collection.as_deref()),
+                // The NAME of a secret, not a secret -- so unlike `adminUrl`
+                // below it is read back, and an operator can see which variable
+                // a store is waiting on.
+                ("credentialRef", config.credential_ref.as_deref()),
                 // Written, never read back -- see the field's own doc comment
                 // and `admin_url_is_write_only`. `None` skips the triple
                 // entirely rather than storing an empty string.
@@ -2275,6 +2417,10 @@ impl<'a> ConfigGraph<'a> {
                 // contreforts-kg#8 has no such triple, and its absence means
                 // `vector` (see `parse_vector_store_column_type`).
                 ("columnType", false),
+                // Chroma's two (contreforts-kg#9), optional for the same
+                // reason: no pgvector or in-memory store has ever stored them.
+                ("collectionName", false),
+                ("credentialRef", false),
             ],
         )?;
         let ns = self.connector_namespace(&VECTOR_STORE);
@@ -2290,6 +2436,10 @@ impl<'a> ConfigGraph<'a> {
                     column_type: parse_vector_store_column_type(
                         f.get("columnType").map(String::as_str),
                     ),
+                    collection: f.get("collectionName").cloned(),
+                    // Read back, unlike `admin_url` below, because it is the
+                    // name of a secret and not one -- see the field's doc.
+                    credential_ref: f.get("credentialRef").cloned(),
                     // Deliberately NOT read from the graph: `adminUrl` is a DDL
                     // credential (contreforts/contreforts-workspace#4). Not
                     // requested in the field list above, so it is not fetched
@@ -4051,9 +4201,19 @@ fn literal_str(s: &str) -> &str {
     }
 }
 
+/// The stored `vectorStoreKind` as a variant.
+///
+/// **The `_` arm is a known defect and is not this change's to fix.** Anything
+/// unrecognised — including a kind written by a newer binary — reads back as
+/// `InMemory`, which is an empty store dressed as a valid answer: exactly the
+/// failure `contreforts-vecdb#15` names. Adding `chroma` here closes the case
+/// that would otherwise be introduced by `contreforts-kg#9` itself; making the
+/// fallback an error is a signature change (`-> Result`) with its own callers
+/// to consider, filed separately.
 fn parse_vector_store_kind(s: Option<&str>) -> VectorStoreKind {
     match s {
         Some("pgvector") => VectorStoreKind::Pgvector,
+        Some("chroma") => VectorStoreKind::Chroma,
         _ => VectorStoreKind::InMemory,
     }
 }
@@ -4337,6 +4497,8 @@ mod tests {
                 kind: VectorStoreKind::Pgvector,
                 url: None,
                 table: Some("chunks".into()),
+                collection: None,
+                credential_ref: None,
                 dimension: 1536,
                 column_type: VectorStoreColumnType::Vector,
                 admin_url: None,
