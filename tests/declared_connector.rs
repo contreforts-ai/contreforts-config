@@ -243,6 +243,130 @@ fn forgejo_only_ttl() -> String {
 // `shown` the alternative declares `sh:minCount > 0` for; `hidden` is
 // (union of every alternative's field ids) - (this alternative's) - discriminator.
 
+/// **An unrecognised discriminant is refused, not stored** (#14).
+///
+/// Before this, `authMode=""` and `authMode="bogus"` were both accepted with no validator
+/// wired: no `VariantRule` matched, nothing was hidden, the write succeeded — and
+/// `get_caldav_connector` then reported `Bearer { token: "" }`, because its discriminant
+/// match is a two-arm `match` with a catch-all. The stored `username`/`password` were still
+/// there and still visible to the generic reader, so the typed and generic APIs disagreed
+/// about what the connector *was*, with no error on either side.
+///
+/// `ConfigGraph::new` — the default constructor, `validator: None` — is exactly the path an
+/// embedder gets. The production path was never exposed: `contreforts-config-api` builds
+/// `with_validator`, and SHACL's `sh:xone` rejects both before anything is stored.
+///
+/// `""` and `"bogus"` are the same defect, which is why refusing only the empty string would
+/// have been arbitrary — the issue says so and both are asserted here.
+#[test]
+fn an_unrecognised_discriminant_is_refused_with_no_validator_wired() {
+    for bogus in ["", "bogus", "Basic", "bearer "] {
+        let (_dir, store) = store();
+        add_company(&store, "acme");
+        let ttl = all_declarations_ttl();
+        let validator = validator_for(&ttl);
+        // The default constructor: no validator. That is the whole exposure.
+        let cg = ConfigGraph::new(&store, validator.declarations());
+
+        let err = cg
+            .set_declared_connector(
+                "acme",
+                "caldav",
+                Some("main"),
+                &patch(&[
+                    ("label", Some("main")),
+                    ("instanceUrl", Some("https://dav.example.com")),
+                    ("authMode", Some(bogus)),
+                    ("username", Some("alice")),
+                    ("password", Some("hunter2")),
+                ]),
+                &caldav_variants(),
+            )
+            .expect_err(&format!("authMode={bogus:?} names no alternative"));
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("authMode"), "{bogus:?}: {rendered}");
+        for declared in ["\"basic\"", "\"bearer\""] {
+            assert!(
+                rendered.contains(declared),
+                "{bogus:?}: the refusal has to name what would work: {rendered}"
+            );
+        }
+
+        // And nothing was written -- a refused write leaves no half-connector behind.
+        assert!(
+            cg.get_caldav_connector("acme", "main")
+                .expect("read succeeds")
+                .is_none(),
+            "{bogus:?}: the refusal must not have stored the connector"
+        );
+    }
+}
+
+/// …and every value that *does* name an alternative still stores.
+///
+/// The half that would be missing otherwise: a check refusing everything would pass the test
+/// above. Both alternatives, because a check that only knew the first would let the second
+/// through as "unrecognised".
+#[test]
+fn every_declared_discriminant_value_is_still_accepted() {
+    for (mode, extra_key, extra_value) in
+        [("basic", "username", "alice"), ("bearer", "token", "t0k3n")]
+    {
+        let (_dir, store) = store();
+        add_company(&store, "acme");
+        let ttl = all_declarations_ttl();
+        let validator = validator_for(&ttl);
+        let cg = ConfigGraph::new(&store, validator.declarations());
+
+        let mut fields = vec![
+            ("label", Some("main")),
+            ("instanceUrl", Some("https://dav.example.com")),
+            ("authMode", Some(mode)),
+            (extra_key, Some(extra_value)),
+        ];
+        if mode == "basic" {
+            fields.push(("password", Some("hunter2")));
+        }
+        cg.set_declared_connector(
+            "acme",
+            "caldav",
+            Some("main"),
+            &patch(&fields),
+            &caldav_variants(),
+        )
+        .unwrap_or_else(|e| panic!("authMode={mode:?} is declared and must store: {e}"));
+    }
+}
+
+/// A caller that supplies **no** rules gets no check.
+///
+/// Deliberate, and stated so it is a decision rather than a hole: with `&[]` there is nothing
+/// to check against, and inventing one would mean this method deciding which fields are
+/// discriminants — which is W4's job, not the config graph's. `variants` is exactly the
+/// information the check needs and the only thing it reads.
+#[test]
+fn no_rules_supplied_means_no_discriminant_check() {
+    let (_dir, store) = store();
+    add_company(&store, "acme");
+    let ttl = all_declarations_ttl();
+    let validator = validator_for(&ttl);
+    let cg = ConfigGraph::new(&store, validator.declarations());
+
+    cg.set_declared_connector(
+        "acme",
+        "caldav",
+        Some("main"),
+        &patch(&[
+            ("label", Some("main")),
+            ("instanceUrl", Some("https://dav.example.com")),
+            ("authMode", Some("bogus")),
+        ]),
+        &[],
+    )
+    .expect("with no rules there is nothing to validate the discriminant against");
+}
+
 fn caldav_variants() -> Vec<VariantRule> {
     vec![
         VariantRule {
