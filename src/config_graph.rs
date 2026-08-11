@@ -1821,6 +1821,66 @@ impl<'a> ConfigGraph<'a> {
             merged.insert("label".to_string(), normalised_label.to_string());
         }
 
+        // The discriminant must name an alternative that exists (#14).
+        //
+        // Without this, an unrecognised value simply matched no `VariantRule`, nothing was
+        // hidden, and the write succeeded. The typed getter then reported the **wrong auth
+        // mode**, because its discriminant match is a two-arm `match` with a catch-all:
+        //
+        // ```
+        // set caldav authMode=""  -> Ok(())
+        // get_caldav_connector    -> Ok(Some(.. auth: Bearer { token: "" } ..))
+        // ```
+        //
+        // …while the generic reader still returned the stored `username`/`password`. Not data
+        // loss — a silent disagreement between the typed and the generic API about what the
+        // connector *is*, with no error on either side. `""` and `"bogus"` behave identically,
+        // which is why refusing only the empty string would have been arbitrary.
+        //
+        // **Scoped to the discriminant, and only when rules were supplied.** A caller passing
+        // `&[]` gets no check — there is nothing to check against, and inventing one would mean
+        // this method deciding which fields are discriminants, which is W4's job. `variants` is
+        // exactly the information needed and the method already has it.
+        //
+        // The production path was never exposed: `contreforts-config-api` builds its graph
+        // `with_validator`, and SHACL's `sh:xone` rejects both values before anything is stored.
+        // This closes the default constructor, `ConfigGraph::new`, which leaves `validator:
+        // None` and is what an embedder gets.
+        let mut discriminant_fields: Vec<&str> = variants
+            .iter()
+            .map(|rule| rule.discriminant_field.as_str())
+            .collect();
+        discriminant_fields.sort_unstable();
+        discriminant_fields.dedup();
+        for field in discriminant_fields {
+            let Some(stored) = merged.get(field) else {
+                // Absent is not this check's business: whether the discriminant is required
+                // is `sh:minCount`'s to say, and the validator's to enforce.
+                continue;
+            };
+            let mut accepted: Vec<&str> = variants
+                .iter()
+                .filter(|rule| rule.discriminant_field == field)
+                .map(|rule| rule.discriminant_value.as_str())
+                .collect();
+            if accepted.iter().any(|value| value == stored) {
+                continue;
+            }
+            accepted.sort_unstable();
+            return Err(ConfigGraphError::ConnectorValidation(format!(
+                "connector kind '{kind}': field '{field}' selects which alternative of an \
+                 sh:xone this connector is, and {stored:?} names none of them (declared: {}). \
+                 Storing it would succeed and then be read back as the wrong alternative -- \
+                 the typed getter falls through to its catch-all arm while the generic reader \
+                 still sees the other alternative's fields, and neither reports an error",
+                accepted
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
         if let Some(rule) = variants
             .iter()
             .find(|rule| merged.get(&rule.discriminant_field) == Some(&rule.discriminant_value))
