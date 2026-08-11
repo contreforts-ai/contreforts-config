@@ -289,60 +289,16 @@ pub enum VectorStoreKind {
     Chroma,
 }
 
-/// The pgvector column type an embedding is stored in — the other half of a
-/// geometry, alongside `dimension` (contreforts-kg#8).
-///
-/// A dimension alone does not describe a geometry: 2048 cannot be indexed as
-/// `vector`, and the same number implies different storage, index types and
-/// accuracy depending on this field. The limits below are the ones
-/// `contreforts-vecdb#6` **measured** against pgvector 0.8.5 on PostgreSQL 16,
-/// not values read off a changelog:
-///
-/// | variant | HNSW builds up to |
-/// |---|---|
-/// | `Vector` | 2 000 dims |
-/// | `Halfvec` | 4 000 dims |
-/// | `Bit` | 4 096 dims — measured working, no limit reached |
-///
-/// Note `vector(1024)` and `halfvec(2048)` are the same 4 096 bytes per row and
-/// the same index size: that pair is f32 across half the axes against f16 across
-/// all of them, not a size/quality trade-off, and only a measurement separates
-/// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum VectorStoreColumnType {
-    /// f32 per axis. The default, because a configuration graph written before
-    /// this field existed describes a `vector(1536)` table — see
-    /// `VectorStoreConnectorConfig::column_type`.
-    #[default]
-    Vector,
-    /// f16 per axis: half the bytes, twice the indexable axes.
-    Halfvec,
-    /// One bit per axis. Cheapest to index and the only variant that reaches
-    /// 4 096, at the cost of needing exact rescoring in the retrieval path.
-    Bit,
-}
-
-impl VectorStoreColumnType {
-    /// The SQL type name, as it appears in DDL and in `information_schema`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Vector => "vector",
-            Self::Halfvec => "halfvec",
-            Self::Bit => "bit",
-        }
-    }
-
-    /// Largest dimension this column type can carry in an HNSW index, measured
-    /// per the table on the type's own documentation.
-    pub fn max_indexable_dimension(&self) -> u32 {
-        match self {
-            Self::Vector => 2_000,
-            Self::Halfvec => 4_000,
-            Self::Bit => 4_096,
-        }
-    }
-}
+// `VectorStoreColumnType` used to be defined here, byte for byte identical to
+// `contreforts_vecdb::VectorStoreColumnType` including the measured HNSW limits. Neither crate
+// could see the other, so nothing checked they agreed -- correct one after a new measurement and
+// forget the other, and a geometry is accepted when a connector is saved and refused when the
+// store is built. It now lives in `contreforts-core::geometry`, which both crates already depend
+// on (contreforts-vecdb#45).
+//
+// Re-exported rather than merely imported: this type is part of this crate's public surface and
+// `contreforts-config-api` names it through here.
+pub use contreforts_core::VectorStoreColumnType;
 
 fn parse_vector_store_column_type(raw: Option<&str>) -> VectorStoreColumnType {
     match raw {
