@@ -32,6 +32,9 @@
 //! Forgejo connector   : `cfdata:connector/forgejo/{slug}/{label}`
 //! GitLab connector    : `cfdata:connector/gitlab/{slug}/{label}`
 //! Group mapping       : `cfdata:mapping/{type}/{slug}/{label}/{group_path}`
+//! Imported ontology   : `cfdata:imported-ontology/{label}` (contreforts-workspace#18, new
+//!                       requirement 1 -- the *record*; its triples live in the separate named
+//!                       graph `crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX` + `{label}`)
 //!
 //! These *data* IRIs (built by `namespaces::connector_iri`) are untouched by
 //! contreforts-kg#21 -- only the *class and predicate* IRIs used at each of those subjects
@@ -39,6 +42,7 @@
 
 use std::collections::BTreeMap;
 
+use oxigraph::io::RdfFormat;
 use oxigraph::model::*;
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +51,8 @@ use contreforts_declaration::{
     ConnectorDeclarations, ConnectorIris, ConnectorValidator, VariantRule,
 };
 
-use crate::ConfigStore;
 use crate::error::{ConfigGraphError, Result};
+use crate::{ConfigStore, IMPORTED_ONTOLOGY_GRAPH_PREFIX};
 
 // ── Public config types ───────────────────────────────────────────────────────
 
@@ -581,6 +585,64 @@ pub struct KgInstanceConfig {
     pub datadir: Option<String>,
 }
 
+/// One ontology an operator has imported into the config store (contreforts-workspace#18, new
+/// requirement 1; #19 D2 -- "config can import ontologies, so an operator can bring in a
+/// third-party or in-house vocabulary as an alignment target").
+///
+/// `graph` is derived from `label` by [`imported_ontology_graph_iri`] and is stored on the record
+/// anyway, rather than recomputed on read. That is deliberate and is the *opposite* choice from
+/// `triple_count` below, for a reason worth stating: the graph IRI is the address of durable data,
+/// so if the derivation rule ever changed, a recomputing reader would silently stop finding
+/// ontologies imported under the old rule -- the stored copy is what makes such a change
+/// detectable ([`ConfigGraph::validate_startup`]'s invariant 3a) instead of invisible.
+///
+/// `triple_count` is the exact reverse: it is **never persisted**, and is counted from the store
+/// on every read. Persisting it would create a fact that can drift -- the raw SPARQL update route
+/// is allowed to write an ontology graph -- and a stored count that disagrees with the graph is
+/// worse than no count, because it reports health while examining nothing. The rejected
+/// alternative (persist it, then constrain the raw route to protect it) was declined: it buys a
+/// cached integer at the price of a second guard to keep it honest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportedOntologyConfig {
+    pub label: String,
+    pub graph: String,
+    /// Where the operator says this vocabulary came from (a URL, a filename, a purchase order).
+    /// Provenance only -- nothing in this crate ever dereferences it. `contreforts-config` has no
+    /// HTTP client and deliberately gains none here: fetching an ontology is the caller's job, so
+    /// an import can never depend on the network being up at startup.
+    pub source_uri: Option<String>,
+    /// Counted live on every read; see this struct's doc comment for why it is not stored.
+    pub triple_count: usize,
+}
+
+/// The RDF syntaxes [`ConfigGraph::import_ontology`] accepts.
+///
+/// Triple-only formats, on purpose. A dataset format (TriG, N-Quads) can name graphs of its own,
+/// and an import must land in exactly one graph -- the one the guard checked. There is also **no
+/// format sniffing**: guessing wrong on a vocabulary an operator paid for and cannot re-derive is
+/// precisely the class of silent failure this issue was filed about, so the caller states the
+/// format and a mismatch surfaces as [`crate::ConfigStoreError::RdfParse`] or
+/// [`crate::ConfigStoreError::EmptyGraphPayload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OntologyFormat {
+    Turtle,
+    NTriples,
+    /// Third-party vocabularies are still routinely published as RDF/XML; refusing it would push
+    /// operators into converting files by hand before importing them.
+    RdfXml,
+}
+
+impl OntologyFormat {
+    fn rdf_format(self) -> RdfFormat {
+        match self {
+            Self::Turtle => RdfFormat::Turtle,
+            Self::NTriples => RdfFormat::NTriples,
+            Self::RdfXml => RdfFormat::RdfXml,
+        }
+    }
+}
+
 /// Outcome of [`ConfigGraph::lookup_kg_instance`], the shared three-way branching
 /// (contreforts-workspace#58 D8, part 1; #18 Q5) behind both
 /// [`ConfigGraph::resolve_kg_instance_label`] and [`ConfigGraph::discover_kg_instance`]. Kept
@@ -993,6 +1055,38 @@ fn kg_instance_iri(label: &str) -> String {
     format!(
         "{}kg-instance/{}",
         namespaces::DATA_NS,
+        urlencoding::encode(label)
+    )
+}
+
+/// IRI for an imported ontology's own **definition record**, scoped by label
+/// (contreforts-workspace#18, new requirement 1). A plain, hand-entered config-graph IRI rooted at
+/// the fixed `DATA_NS`, exactly like [`kg_instance_iri`] and for the same reason
+/// (`tests/config_iri_invariance.rs`): the record is entered by an operator and is not
+/// re-derivable by any sync, so it must never be re-prefixed by an instance's assigned prefix.
+/// Private -- nothing outside this module needs the record's subject, only the fields it carries.
+fn imported_ontology_iri(label: &str) -> String {
+    format!(
+        "{}imported-ontology/{}",
+        namespaces::DATA_NS,
+        urlencoding::encode(label)
+    )
+}
+
+/// IRI of the **named graph** an imported ontology's triples live in.
+///
+/// Public, unlike `imported_ontology_iri`: this is the graph a consumer has to name to query an
+/// imported vocabulary (a SPARQL alignment query, or the config UI joining config instances
+/// against declarations and imported concepts in one query -- #19 D5's argument for putting
+/// declarations in a graph at all).
+///
+/// `urlencoding::encode` on the label is what makes the prefix test sound: an encoded label
+/// contains no `/`, so `{IMPORTED_ONTOLOGY_GRAPH_PREFIX}{encoded}` can never reach outside the
+/// prefix, and no label can be crafted to make this collide with [`crate::PRODUCT_GRAPH`]
+/// (`.../data/graph/product`) or [`CONFIG_GRAPH`] (`.../data/graph/config`).
+pub fn imported_ontology_graph_iri(label: &str) -> String {
+    format!(
+        "{IMPORTED_ONTOLOGY_GRAPH_PREFIX}{}",
         urlencoding::encode(label)
     )
 }
@@ -3460,6 +3554,185 @@ impl<'a> ConfigGraph<'a> {
         Ok(None)
     }
 
+    // ── Imported ontologies (contreforts-workspace#18, new requirement 1) ────
+    //
+    // The third class of graph in this store (see `crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX`'s
+    // table). Operator-supplied vocabulary, durable, never rebuilt at startup. Two records per
+    // import: a definition record in CONFIG_GRAPH (label, graph IRI, optional provenance) and the
+    // ontology's own named graph. The definition record is what makes an import enumerable,
+    // removable, and checkable at startup; a bare graph with no record would be invisible to every
+    // one of those.
+
+    /// Import (or re-import) an ontology under `label`, replacing whatever that label held before.
+    /// Returns the record as stored, with `triple_count` read back from the store.
+    ///
+    /// Guard: the graph this mints must not fall under any registered `KgInstanceConfig`'s
+    /// `iri_prefix` -- see [`ConfigGraphError::ImportedOntologyGraphCollidesWithInstance`].
+    /// [`crate::ConfigStore::replace_named_graph`] separately refuses the reserved product graph
+    /// and the config graph, so all three protected spaces are covered, each by the layer that
+    /// owns it and each with its own named error.
+    ///
+    /// **Not guarded against here, deliberately: a registered KB's own `graph`.** Every other
+    /// write path in this file calls `reject_kb_graph_reference`; this one does not,
+    /// because the check is unreachable rather than merely unlikely -- a KB's graph must fall under
+    /// its instance's registered prefix ([`Self::set_knowledge_base`]'s own guard), and an instance
+    /// prefix broad enough to also cover [`IMPORTED_ONTOLOGY_GRAPH_PREFIX`] is already refused two
+    /// lines below. Adding the call would produce a branch no test could ever exercise, which this
+    /// repo treats as worse than no branch.
+    ///
+    /// **Order of operations: graph first, record second.** If the process dies between them, the
+    /// graph holds data no record names -- which [`Self::validate_startup`] cannot see, but which
+    /// re-importing the same label repairs completely (the replace clears it first). The reverse
+    /// order would leave a record naming a graph that was never written, i.e. a
+    /// reported-as-healthy import of nothing.
+    pub fn import_ontology(
+        &self,
+        label: &str,
+        source_uri: Option<&str>,
+        format: OntologyFormat,
+        data: &[u8],
+    ) -> Result<ImportedOntologyConfig> {
+        let graph_iri = imported_ontology_graph_iri(label);
+        self.reject_ontology_graph_collision(label, &graph_iri)?;
+
+        let graph_node = self.node(&graph_iri)?;
+        let triple_count =
+            self.store
+                .replace_named_graph(&graph_node, format.rdf_format(), data)?;
+
+        let record = ImportedOntologyConfig {
+            label: label.to_string(),
+            graph: graph_iri,
+            source_uri: source_uri.map(str::to_string),
+            triple_count,
+        };
+        self.write_imported_ontology_record(&record)?;
+        Ok(record)
+    }
+
+    /// Fetch one imported ontology's record by label, or `None` if never imported.
+    ///
+    /// `sourceUri` is read with `OPTIONAL`, the same way [`KgInstanceConfig::datadir`] is and for
+    /// the same reason: a strict join on an optional field silently hides whole records, and a
+    /// hidden record is one [`Self::validate_startup`] never examines.
+    pub fn get_imported_ontology(&self, label: &str) -> Result<Option<ImportedOntologyConfig>> {
+        let iri = imported_ontology_iri(label);
+        let sparql = format!(
+            "SELECT ?graph ?source WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               <{iri}> a <{CORE_NS}ImportedOntology> ; <{CORE_NS}graphIri> ?graph . \
+               OPTIONAL {{ <{iri}> <{CORE_NS}sourceUri> ?source }} \
+             }} }}"
+        );
+        let rows = self.store.select(&sparql)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let graph = col(row, "graph")
+            .ok_or_else(|| ConfigGraphError::InvalidIri("missing graphIri".into()))?;
+        let triple_count = self.store.named_graph_len(&self.node(&graph)?)?;
+        Ok(Some(ImportedOntologyConfig {
+            label: label.to_string(),
+            graph,
+            source_uri: col(row, "source"),
+            triple_count,
+        }))
+    }
+
+    /// Every imported ontology, each with its live triple count.
+    pub fn list_imported_ontologies(&self) -> Result<Vec<ImportedOntologyConfig>> {
+        let sparql = format!(
+            "SELECT ?label ?graph ?source WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ \
+               ?ont a <{CORE_NS}ImportedOntology> ; \
+                    <{CORE_NS}label> ?label ; \
+                    <{CORE_NS}graphIri> ?graph . \
+               OPTIONAL {{ ?ont <{CORE_NS}sourceUri> ?source }} \
+             }} }}"
+        );
+        self.store
+            .select(&sparql)?
+            .into_iter()
+            .map(|row| {
+                let graph = col(&row, "graph")
+                    .ok_or_else(|| ConfigGraphError::InvalidIri("missing graphIri".into()))?;
+                let triple_count = self.store.named_graph_len(&self.node(&graph)?)?;
+                Ok(ImportedOntologyConfig {
+                    label: col(&row, "label")
+                        .ok_or_else(|| ConfigGraphError::InvalidIri("missing label".into()))?,
+                    graph,
+                    source_uri: col(&row, "source"),
+                    triple_count,
+                })
+            })
+            .collect()
+    }
+
+    /// Remove an imported ontology: its graph *and* its definition record. Returns how many
+    /// triples were dropped.
+    ///
+    /// An unknown label is [`ConfigGraphError::ImportedOntologyUnregistered`], never a silent
+    /// `Ok(())` -- #18 Q4's "wipe is not delete" reasoning restated for this record type: the
+    /// caller must be able to tell "there was nothing there" from "it is gone now".
+    ///
+    /// **Graph first, record second**, the recoverable ordering: a failure between the two leaves
+    /// a record naming an empty graph, which [`Self::validate_startup`] reports and which a second
+    /// call to this method finishes cleaning up. The reverse would leave an orphan graph with no
+    /// record -- invisible to every listing and unreachable by any delete.
+    ///
+    /// Unlike [`Self::remove_kg_instance`] and [`Self::remove_knowledge_base`], this takes no
+    /// referential guard, and that is a statement rather than an omission: nothing in the config
+    /// graph references an imported ontology **today**. When per-instance term alignment lands
+    /// (contreforts-workspace#81, #18's new requirement 2), a mapping record will reference an
+    /// imported concept, and this method must grow a blocked-by-mapping refusal in that same
+    /// change -- the pattern [`Self::remove_knowledge_base`] already establishes.
+    pub fn remove_imported_ontology(&self, label: &str) -> Result<usize> {
+        let Some(record) = self.get_imported_ontology(label)? else {
+            return Err(ConfigGraphError::imported_ontology_unregistered(label));
+        };
+
+        let graph_node = self.node(&record.graph)?;
+        let removed = self.store.clear_named_graph(&graph_node)?;
+
+        let record_node = self.node(&imported_ontology_iri(label))?;
+        remove_subject_from_named_graph(self.store, &record_node, &self.graph)?;
+        Ok(removed)
+    }
+
+    /// Refuse an ontology graph that falls inside a registered KG instance's IRI space. The
+    /// write-time half of [`Self::validate_startup`]'s invariant 3b; see
+    /// [`ConfigGraphError::ImportedOntologyGraphCollidesWithInstance`] for why the direction
+    /// matters.
+    fn reject_ontology_graph_collision(&self, label: &str, graph_iri: &str) -> Result<()> {
+        for instance in self.list_kg_instances()? {
+            if graph_iri.starts_with(&instance.iri_prefix) {
+                return Err(
+                    ConfigGraphError::imported_ontology_graph_collides_with_instance(
+                        label,
+                        graph_iri,
+                        &instance.label,
+                        &instance.iri_prefix,
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Write (replacing) one imported ontology's definition record. `triple_count` is **not**
+    /// written -- see [`ImportedOntologyConfig`]'s doc comment.
+    fn write_imported_ontology_record(&self, record: &ImportedOntologyConfig) -> Result<()> {
+        let node = self.node(&imported_ontology_iri(&record.label))?;
+        remove_subject_from_named_graph(self.store, &node, &self.graph)?;
+        self.write_type(&node, &format!("{CORE_NS}ImportedOntology"))?;
+        self.write_literal(&node, &format!("{CORE_NS}label"), &record.label, None)?;
+        self.write_literal(&node, &format!("{CORE_NS}graphIri"), &record.graph, None)?;
+        if let Some(uri) = &record.source_uri {
+            self.write_literal(&node, &format!("{CORE_NS}sourceUri"), uri, None)?;
+        }
+        Ok(())
+    }
+
     // ── KB-reference guard (contreforts-workspace#58 D5, second invariant) ───
     //
     // #18 Q3 / comment 7969: "exactly one config record may name a KB graph IRI -- the KB's own
@@ -3586,8 +3859,9 @@ impl<'a> ConfigGraph<'a> {
     // directly against the store's actual contents, so a corruption that arrived any other way
     // is still caught -- later than write time, but not never.
 
-    /// Re-check both of D5's invariants against the store's actual contents, independent of
-    /// whichever write path (if any) put them there. Returns every violation found, each naming
+    /// Re-check both of D5's invariants -- and, since contreforts-workspace#18's new requirement
+    /// 1, invariant 3 on imported ontologies -- against the store's actual contents, independent
+    /// of whichever write path (if any) put them there. Returns every violation found, each naming
     /// the offending record, the offending value, and the rule violated -- not merely the first
     /// one, so a single corrupted store surfaces its whole problem at once rather than one
     /// restart at a time.
@@ -3737,6 +4011,57 @@ impl<'a> ConfigGraph<'a> {
                             "'{s}' stores '{o}' on predicate <{p}> -- that value is a \
                              registered knowledge base's own graph IRI, which only that KB's own \
                              `KnowledgeBaseConfig.graph` may hold"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Invariant 3 (contreforts-workspace#18, new requirement 1): every imported ontology must
+        // (a) live under the prefix reserved for imports, (b) not fall inside a registered KG
+        // instance's IRI space, and (c) actually hold triples.
+        //
+        // (b) is the half no write-time guard can cover on its own: `import_ontology` checks the
+        // instances registered *at import time*, and an instance registered afterwards with a
+        // broad prefix swallows an ontology that was legitimate when it landed. Same shape as
+        // invariant 1's "instances registered after the KB was written" case above, and the reason
+        // #18 Q3 answered "write-time *and* startup" rather than either alone.
+        //
+        // (c) is what turns the record/graph pair's non-atomicity into a reported condition rather
+        // than a silent one: a record naming an empty graph is a phantom import -- listed in the
+        // UI, aligned against by nothing, reporting a vocabulary that is not there. Also the one
+        // thing that catches an ontology graph emptied through the raw SPARQL update route, which
+        // is deliberately still allowed to write these graphs (they are configuration, not
+        // reserved data), and which therefore cannot be relied on to leave them intact.
+        match self.list_imported_ontologies() {
+            Err(e) => violations.push(format!("failed to list imported ontologies: {e}")),
+            Ok(ontologies) => {
+                for ontology in ontologies {
+                    if !ontology.graph.starts_with(IMPORTED_ONTOLOGY_GRAPH_PREFIX) {
+                        violations.push(format!(
+                            "imported ontology '{}' names graph '{}', which is not under the \
+                             reserved imported-ontology prefix '{}' -- an import's graph is \
+                             minted, not chosen, so this record was not written by \
+                             `import_ontology`",
+                            ontology.label, ontology.graph, IMPORTED_ONTOLOGY_GRAPH_PREFIX
+                        ));
+                    }
+                    if let Some(instance) = instances
+                        .iter()
+                        .find(|i| ontology.graph.starts_with(&i.iri_prefix))
+                    {
+                        violations.push(format!(
+                            "imported ontology '{}' lives in graph '{}', which falls under \
+                             registered KG instance '{}' (IRI prefix '{}') -- a re-sync of that \
+                             instance would destroy an operator-supplied vocabulary",
+                            ontology.label, ontology.graph, instance.label, instance.iri_prefix
+                        ));
+                    }
+                    if ontology.triple_count == 0 {
+                        violations.push(format!(
+                            "imported ontology '{}' is registered against graph '{}', but that \
+                             graph holds no triples -- the import is recorded and absent",
+                            ontology.label, ontology.graph
                         ));
                     }
                 }

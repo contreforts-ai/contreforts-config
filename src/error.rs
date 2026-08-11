@@ -86,6 +86,26 @@
 //! variants to 404 (there is nothing to delete) and the three `*BlockedBy*` variants to 409,
 //! matching the `KgInstance*Conflict` trio's own precedent that a referential conflict is a
 //! client error, not a server fault.
+//!
+//! Two more, added for contreforts-workspace#18's **new requirement 1** (the config store must be
+//! able to import ontologies -- the one item of #18's stated scope that phase D never filed as a
+//! sub-task): [`ImportedOntologyGraphCollidesWithInstance`](ConfigGraphError::ImportedOntologyGraphCollidesWithInstance)
+//! and [`ImportedOntologyUnregistered`](ConfigGraphError::ImportedOntologyUnregistered). Neither
+//! reuses [`InvalidIri`](ConfigGraphError::InvalidIri) -- reusing it is precisely what D8 part 2c's
+//! sweep just finished undoing, and "no route reaches it yet" is the same justification that made
+//! the original reuse look safe. `contreforts-config-api/src/error.rs`'s `ApiError::status` must
+//! answer **400** for the collision (an instance prefix chosen broadly enough to swallow the
+//! imported-ontology prefix is the caller's mistake, exactly like
+//! [`KbGraphPrefixViolation`](ConfigGraphError::KbGraphPrefixViolation)) and **404** for the
+//! unregistered case (nothing to remove, exactly like
+//! [`KnowledgeBaseUnregistered`](ConfigGraphError::KnowledgeBaseUnregistered) /
+//! [`KgInstanceUnregisteredForDelete`](ConfigGraphError::KgInstanceUnregisteredForDelete)).
+//! Without those arms both fall through that file's `Self::Graph(_)` catch-all to a 500 -- the
+//! defect this module doc already records as having happened once on this phase. The same applies
+//! to the three [`ConfigStoreError`] variants `ConfigGraph::import_ontology` can surface through
+//! [`Store`](ConfigGraphError::Store) -- `RdfParse`, `EmptyGraphPayload` and
+//! `DestructiveReplaceRefused` -- all three properties of what the caller supplied, so all three
+//! 400.
 use crate::ConfigStoreError;
 
 /// The ported config-graph engine's own error type. See the module docs above for the three
@@ -318,6 +338,43 @@ pub enum ConfigGraphError {
         kb_label: String,
         company_slug: String,
     },
+
+    /// contreforts-workspace#18 (new requirement 1): `ConfigGraph::import_ontology` refused
+    /// because the graph it would mint for `label` falls under a registered `KgInstanceConfig`'s
+    /// `iri_prefix`.
+    ///
+    /// This is the one-directional rule (#18 point 4) applied to the new graph class. An imported
+    /// ontology is durable configuration; a KG instance's IRI space is explicitly disposable under
+    /// drop-and-re-sync. An ontology sitting inside it would be destroyed by the routine operation
+    /// this whole issue exists to make safe -- and destroyed *silently*, since nothing else in the
+    /// system would notice a vocabulary had gone missing until an alignment quietly stopped
+    /// resolving.
+    ///
+    /// Decidable by prefix, exactly as #18 argued the guard would be. Reachable only when an
+    /// operator assigns an instance a prefix broad enough to swallow
+    /// [`crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX`]; `ConfigGraph::validate_startup` re-checks it,
+    /// which is what covers the opposite ordering (ontology imported first, swallowing instance
+    /// registered afterwards) that no write-time check on `import_ontology` can see.
+    #[error(
+        "imported ontology '{label}' would live in graph '{graph}', which falls under \
+         registered KG instance '{instance_label}' (IRI prefix '{instance_prefix}') -- an \
+         imported ontology is durable configuration and must not sit inside a KG instance's \
+         disposable data space"
+    )]
+    ImportedOntologyGraphCollidesWithInstance {
+        label: String,
+        graph: String,
+        instance_label: String,
+        instance_prefix: String,
+    },
+
+    /// contreforts-workspace#18 (new requirement 1): `ConfigGraph::remove_imported_ontology` was
+    /// asked to remove a label naming no registered import. Mirrors
+    /// [`Self::KnowledgeBaseUnregistered`] / [`Self::KgInstanceUnregisteredForDelete`]: a silent
+    /// `Ok(())` here is indistinguishable from a real removal, and would let an operator believe a
+    /// vocabulary was gone while it is still loaded and still being aligned against.
+    #[error("imported ontology '{label}' is not registered -- nothing to remove")]
+    ImportedOntologyUnregistered { label: String },
 }
 
 /// D5/D6/D8-discovery's guard rejections, each raised as one of the seven named variants above
@@ -427,6 +484,28 @@ impl ConfigGraphError {
             label: label.to_string(),
             kb_label: kb_label.to_string(),
             company_slug: company_slug.to_string(),
+        }
+    }
+
+    /// See [`Self::ImportedOntologyGraphCollidesWithInstance`].
+    pub(crate) fn imported_ontology_graph_collides_with_instance(
+        label: &str,
+        graph: &str,
+        instance_label: &str,
+        instance_prefix: &str,
+    ) -> Self {
+        Self::ImportedOntologyGraphCollidesWithInstance {
+            label: label.to_string(),
+            graph: graph.to_string(),
+            instance_label: instance_label.to_string(),
+            instance_prefix: instance_prefix.to_string(),
+        }
+    }
+
+    /// See [`Self::ImportedOntologyUnregistered`].
+    pub(crate) fn imported_ontology_unregistered(label: &str) -> Self {
+        Self::ImportedOntologyUnregistered {
+            label: label.to_string(),
         }
     }
 }
