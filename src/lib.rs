@@ -54,7 +54,7 @@ pub use config_graph::{
 };
 pub use migration::{MigrationOutcome, verify_config_graph_copy};
 #[cfg(feature = "legacy-combined-store-migration")]
-pub use migration::migrate_config_graph_if_needed;
+pub use migration::{migrate_config_graph_if_needed, migrate_rocksdb_datadir_if_needed};
 // Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
 // `ConfigStoreError`-returning functions below already spell `Result<T, ConfigStoreError>` with
 // two type parameters, and bringing `error::Result<T>` (one type parameter) into scope here
