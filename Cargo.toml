@@ -6,10 +6,26 @@ license.workspace = true
 authors.workspace = true
 description = "Configuration's own Oxigraph store and datadir, separate from contreforts-kg"
 
+[features]
+# Off by default: this crate's own store is pure in-memory + on-disk file persistence (see
+# `src/persistence.rs`) and needs no RocksDB. This feature exists only for
+# `migration::migrate_config_graph_if_needed`, which opens a *pre-existing* combined
+# contreforts-kg store -- itself RocksDB-backed -- to copy hand-entered configuration out of it
+# exactly once. A binary that still has environments needing that one-time copy enables this
+# explicitly; every other consumer never pulls the `oxrocksdb-sys` native/C++ build dependency
+# in at all.
+legacy-combined-store-migration = ["oxigraph/rocksdb"]
+
 [dependencies]
 # The store itself -- contreforts-workspace#18's design gives configuration its
-# own Oxigraph runtime, independent of contreforts-kg's.
-oxigraph = { workspace = true }
+# own Oxigraph runtime, independent of contreforts-kg's. Not `{ workspace = true }`: the
+# workspace's own `oxigraph = "0.5"` entry doesn't disable oxigraph's default `rocksdb` feature
+# (Cargo forbids a dependent overriding `default-features` unless the workspace entry itself
+# sets `default-features = false`), and this crate has been asked to stop shipping that
+# dependency -- `ConfigStore` opens no RocksDB-backed `Store` anywhere (see `src/persistence.rs`).
+# Pinned to the same "0.5" the workspace uses, with RocksDB off outright rather than merely
+# optional.
+oxigraph = { version = "0.5", default-features = false }
 # Named error for an unusable store path (contreforts-workspace#58 D2) -- no
 # panic, no silent fallback to a temp or current directory.
 thiserror = { workspace = true }

@@ -1046,6 +1046,7 @@ fn insert_in_named_graph(
         object.clone(),
         GraphName::NamedNode(graph.clone()),
     ))?;
+    store.persist_graph(graph)?;
     Ok(())
 }
 
@@ -1107,6 +1108,7 @@ fn remove_subject_from_named_graph(
     for quad in quads {
         store.inner().remove(&quad)?;
     }
+    store.persist_graph(graph)?;
     Ok(())
 }
 
@@ -1141,6 +1143,7 @@ fn remove_subject_from_named_graph_except(
         }
         store.inner().remove(&quad)?;
     }
+    store.persist_graph(graph)?;
     Ok(())
 }
 
@@ -1170,6 +1173,7 @@ fn remove_subject_predicate_from_named_graph(
     for quad in quads {
         store.inner().remove(&quad)?;
     }
+    store.persist_graph(graph)?;
     Ok(())
 }
 

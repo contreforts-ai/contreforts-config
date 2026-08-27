@@ -41,6 +41,12 @@
 //!
 //! Every IRI below is a full bracketed `<...>` (via `NamedNode::new`) or built through
 //! `contreforts_core::namespaces`' own builders -- never a raw `/` in a prefixed-name local part.
+//!
+//! Gated behind the `legacy-combined-store-migration` Cargo feature (off by default): fabricating
+//! the fixture "combined store" below needs oxigraph's RocksDB backend, which this crate
+//! otherwise no longer links (see `src/persistence.rs`'s module doc). Run with
+//! `cargo test -p contreforts-config --features legacy-combined-store-migration`.
+#![cfg(feature = "legacy-combined-store-migration")]
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -112,13 +118,19 @@ fn all_quads(store: &Store) -> Vec<Quad> {
 /// that copies the first subject and stops must fail this" -- is exactly why this fixture uses
 /// five distinct config subjects rather than one.
 ///
-/// Built entirely through `contreforts_config::ConfigGraph`, so this crate's own migration test
-/// never needs `contreforts-kg` to construct a realistic source store.
+/// The triples themselves are generated through `contreforts_config::ConfigGraph` (against a
+/// throwaway, in-memory-backed `ConfigStore`), so their shape can never drift from what the real
+/// engine writes -- but `path` itself ends up a genuine RocksDB-backed `oxigraph::store::Store`,
+/// matching what a real legacy combined store looks like on disk. `contreforts_config::ConfigStore`
+/// is no longer RocksDB-backed itself (`src/persistence.rs`), so it can no longer double as this
+/// fixture's own on-disk format the way it once did -- `open_store` (what
+/// `migrate_config_graph_if_needed` actually reads `path` with) needs RocksDB there for real.
 ///
 /// Returns the exact CONFIG_GRAPH triple set written, so callers can assert the migrated content
 /// against it directly rather than re-deriving it.
 fn build_combined_store(path: &Path) -> BTreeSet<(String, String, String)> {
-    let store = config_store_at(path);
+    let scratch_dir = tempfile::tempdir().expect("tempdir for the fixture-generating scratch store");
+    let store = config_store_at(&scratch_dir.path().join("scratch"));
     let cg = ConfigGraph::new(&store, ConnectorDeclarations::none());
 
     cg.set_kg_instance(&KgInstanceConfig {
@@ -186,7 +198,17 @@ fn build_combined_store(path: &Path) -> BTreeSet<(String, String, String)> {
         .expect("inserting the KG-data triple succeeds");
 
     let triples = config_graph_triples(store.inner());
+    let fixture_quads = all_quads(store.inner());
     drop(store);
+
+    let combined = Store::open(path).expect("opening the RocksDB-backed combined-store fixture");
+    for quad in fixture_quads {
+        combined
+            .insert(&quad)
+            .expect("copying a fixture quad into the combined store");
+    }
+    drop(combined);
+
     triples
 }
 

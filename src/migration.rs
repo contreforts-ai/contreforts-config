@@ -25,10 +25,12 @@
 //! than silence -- it would devalue the loud, one-time logging the real migration path below
 //! genuinely needs. So [`MigrationOutcome::ConfigStoreAlreadyPopulated`] is a plain no-op: no
 //! `tracing` event at all on this path. Do not "fix" this into a warning.
+#[cfg(feature = "legacy-combined-store-migration")]
 use std::path::Path;
 
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::store::Store;
+#[cfg(feature = "legacy-combined-store-migration")]
 use tracing::info;
 
 use contreforts_core::namespaces::CONFIG_GRAPH;
@@ -90,6 +92,11 @@ pub enum MigrationOutcome {
 /// - [`ConfigStoreError::Open`] if a store exists at `combined_store_path` but cannot be opened.
 /// - [`ConfigStoreError::Storage`] if reading or writing quads fails.
 /// - [`ConfigStoreError::ConfigGraphCopyIncomplete`] if verification finds the copy incomplete.
+///
+/// Gated behind the `legacy-combined-store-migration` Cargo feature (off by default): reading
+/// `combined_store_path` needs oxigraph's RocksDB backend, which this crate otherwise no longer
+/// links (see `crate::persistence`'s module doc).
+#[cfg(feature = "legacy-combined-store-migration")]
 pub fn migrate_config_graph_if_needed(
     combined_store_path: impl AsRef<Path>,
     config_store: &ConfigStore,
@@ -188,6 +195,7 @@ fn config_graph_quads(store: &Store) -> Result<Vec<Quad>, ConfigStoreError> {
 
 /// Whether `store` holds any `CONFIG_GRAPH` triple at all -- deliberately not "is the whole
 /// store empty" (see this module's top doc comment for why).
+#[cfg(feature = "legacy-combined-store-migration")]
 fn config_graph_is_populated(store: &Store) -> Result<bool, ConfigStoreError> {
     let graph = config_graph_name();
     match store
@@ -205,10 +213,12 @@ fn config_graph_name() -> NamedNode {
 }
 
 /// Open a store at `path`, mapping a failure onto the same [`ConfigStoreError::Open`] shape
-/// [`ConfigStore::open`] itself uses.
+/// [`ConfigStore::open`] itself uses. Requires the `legacy-combined-store-migration` feature --
+/// see [`migrate_config_graph_if_needed`]'s doc comment.
+#[cfg(feature = "legacy-combined-store-migration")]
 fn open_store(path: &Path) -> Result<Store, ConfigStoreError> {
     Store::open(path).map_err(|source| ConfigStoreError::Open {
         path: path.to_path_buf(),
-        source,
+        source: std::io::Error::other(source),
     })
 }

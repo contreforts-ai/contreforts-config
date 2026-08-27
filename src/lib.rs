@@ -40,6 +40,7 @@
 pub mod config_graph;
 pub mod error;
 pub mod migration;
+mod persistence;
 
 pub use config_graph::{
     AgentConfig, CaldavConnectorAuth, CaldavConnectorConfig, ChannelRef,
@@ -51,7 +52,9 @@ pub use config_graph::{
     VectorStoreColumnType, VectorStoreConnectorConfig, VectorStoreKind, VisioConnectorConfig,
     all_connector_kinds, imported_ontology_graph_iri,
 };
-pub use migration::{MigrationOutcome, migrate_config_graph_if_needed, verify_config_graph_copy};
+pub use migration::{MigrationOutcome, verify_config_graph_copy};
+#[cfg(feature = "legacy-combined-store-migration")]
+pub use migration::migrate_config_graph_if_needed;
 // Deliberately *not* re-exported as a bare `Result` at this crate's root: this file's own
 // `ConfigStoreError`-returning functions below already spell `Result<T, ConfigStoreError>` with
 // two type parameters, and bringing `error::Result<T>` (one type parameter) into scope here
@@ -63,7 +66,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use contreforts_core::namespaces::CONFIG_GRAPH;
+use contreforts_core::namespaces::{CONFIG_GRAPH, CORE_NS};
 use oxigraph::io::{RdfFormat, RdfParseError, RdfParser};
 use oxigraph::model::{GraphName, NamedNode, Quad, Term};
 use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
@@ -245,8 +248,15 @@ fn per_user_default_from(data_dir: Option<PathBuf>) -> Result<PathBuf, ConfigSto
 /// contreforts-workspace#18's recurring defect.
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigStoreError {
+    /// [`ConfigStore::open`]'s datadir could not be created or is unusable (for example, a
+    /// regular file occupies where a directory component is required). No longer an oxigraph
+    /// `StorageError` -- this crate's store is in-memory (see `persistence` module doc), so
+    /// `open` only ever touches the filesystem itself, never oxigraph's own on-disk backend.
     #[error("cannot open config store at {path}: {source}")]
-    Open { path: PathBuf, source: StorageError },
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error(
         "cannot determine a per-user OS data directory to place the config store in; \
@@ -335,6 +345,39 @@ pub enum ConfigStoreError {
     /// not a server fault.
     #[error("failed to parse the supplied RDF: {0}")]
     RdfParse(#[from] RdfParseError),
+
+    /// A named graph could not be serialized for on-disk persistence (`persistence` module).
+    /// Distinct from [`Self::Storage`] (an oxigraph store operation failing) and
+    /// [`Self::RdfParse`] (an operator-supplied payload failing to parse) -- this is this
+    /// crate's own dump-to-disk step, on the write side.
+    #[error("failed to serialize named graph <{graph}> for on-disk persistence: {reason}")]
+    PersistSerialize { graph: String, reason: String },
+
+    /// Writing (or reading back) a persisted graph file failed at the filesystem level -- disk
+    /// full, permissions, or similar. Every mutating [`ConfigStore`] method persists
+    /// synchronously before returning `Ok`, so this surfaces at exactly the call that would
+    /// otherwise have reported success over a write that never reached disk.
+    #[error("failed to persist named graph <{graph}> to {path}: {source}")]
+    PersistWrite {
+        graph: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// [`ConfigStore::open`] found a persisted graph file that fails to parse, and none of its
+    /// last `attempted` backup generations parse either. Refused rather than silently starting
+    /// that graph empty -- this crate's recurring rule (contreforts-workspace#18) applied to
+    /// storage corruption instead of an unusable path.
+    #[error(
+        "config data at {path} is corrupt, and none of its last {attempted} backup(s) could \
+         be recovered either -- refusing to start with this graph silently emptied, since the \
+         data may still be recoverable by hand; last parse error: {reason}"
+    )]
+    CorruptGraphFile {
+        path: PathBuf,
+        attempted: usize,
+        reason: String,
+    },
 }
 
 /// Configuration's own persistent Oxigraph store, wrapping an `Arc<Store>` so
@@ -355,27 +398,110 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    /// Open or create a persistent config store at `path`.
+    /// Open or create a config store rooted at `path`: an in-memory Oxigraph `Store` (this crate
+    /// ships no RocksDB backend -- see the `persistence` module doc) loaded from whatever
+    /// `path` already holds.
     ///
     /// Returns [`ConfigStoreError::Open`] — never panics, never silently
     /// falls back to a temp or current directory — when `path` cannot be
     /// used (for example, a regular file occupies where a directory
     /// component is required).
+    ///
+    /// Loads [`CONFIG_GRAPH`] from `path`'s persisted file, then every imported ontology
+    /// **registered in [`CONFIG_GRAPH`]** (not by scanning `path`'s `ontologies/` directory --
+    /// the definition record is what makes an import enumerable, per
+    /// [`IMPORTED_ONTOLOGY_GRAPH_PREFIX`]'s own doc comment, so a stray file with no record is
+    /// deliberately left unloaded rather than resurrected). [`PRODUCT_GRAPH`] is never loaded
+    /// here: it holds no persisted file at all, and starts empty until a caller reloads it from
+    /// the binary's own compiled-in Turtle ([`Self::reload_product_graph`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ConfigStoreError> {
         let path = path.as_ref();
-        let store = Store::open(path).map_err(|source| ConfigStoreError::Open {
+        std::fs::create_dir_all(path).map_err(|source| ConfigStoreError::Open {
             path: path.to_path_buf(),
             source,
         })?;
-        Ok(Self {
+
+        let store = Store::new()?;
+        let this = Self {
             store: Arc::new(store),
             path: Some(path.to_path_buf()),
-        })
+        };
+
+        let config_graph_node = NamedNode::new(CONFIG_GRAPH).expect("CONFIG_GRAPH is a valid IRI");
+        let config_graph_path = path.join(
+            persistence::graph_relpath(CONFIG_GRAPH).expect("CONFIG_GRAPH always maps to a file"),
+        );
+        persistence::load_graph_with_recovery(&this.store, &config_graph_path, &config_graph_node)?;
+
+        for graph_iri in this.registered_ontology_graph_iris()? {
+            let Some(rel) = persistence::graph_relpath(&graph_iri) else {
+                continue;
+            };
+            let node = NamedNode::new(&graph_iri).map_err(|source| ConfigStoreError::CorruptGraphFile {
+                path: path.join(&rel),
+                attempted: 0,
+                reason: format!("CONFIG_GRAPH registers an invalid ontology graph IRI {graph_iri:?}: {source}"),
+            })?;
+            persistence::load_graph_with_recovery(&this.store, &path.join(&rel), &node)?;
+        }
+
+        Ok(this)
+    }
+
+    /// Every graph IRI a `CONFIG_GRAPH`-resident `ImportedOntology` record names, read with the
+    /// same `?graph` shape [`config_graph::ConfigGraph::list_imported_ontologies`] queries --
+    /// duplicated rather than shared because that method lives one layer up (on `ConfigGraph`,
+    /// which wraps a `&ConfigStore` that does not exist yet at the point [`Self::open`] needs
+    /// this).
+    fn registered_ontology_graph_iris(&self) -> Result<Vec<String>, ConfigStoreError> {
+        let sparql = format!(
+            "SELECT ?graph WHERE {{ \
+             GRAPH <{CONFIG_GRAPH}> {{ ?ont a <{CORE_NS}ImportedOntology> ; <{CORE_NS}graphIri> ?graph }} \
+             }}"
+        );
+        Ok(self
+            .select(&sparql)?
+            .into_iter()
+            .filter_map(|row| row.into_iter().find(|(name, _)| name == "graph").map(|(_, v)| v))
+            .collect())
     }
 
     /// Borrow the underlying Oxigraph store.
     pub fn inner(&self) -> &Store {
         &self.store
+    }
+
+    /// Serialize `graph`'s current contents to its on-disk file (see the `persistence` module
+    /// doc), or does nothing for a graph this crate never persists ([`PRODUCT_GRAPH`] -- rebuilt
+    /// from compiled-in Turtle at every startup, so a copy on disk would only ever be stale).
+    ///
+    /// Called at the end of every operation that mutates a named graph's contents -- in this
+    /// file and in [`config_graph`] alike -- so a caller that gets `Ok(())` back already has the
+    /// write durable on disk; there is no separate flush step to forget.
+    pub(crate) fn persist_graph(&self, graph: &NamedNode) -> Result<(), ConfigStoreError> {
+        let Some(dir) = &self.path else {
+            return Ok(());
+        };
+        let Some(rel) = persistence::graph_relpath(graph.as_str()) else {
+            return Ok(());
+        };
+
+        let mut buf = Vec::new();
+        self.store
+            .dump_graph_to_writer(graph, RdfFormat::Turtle, &mut buf)
+            .map_err(|source| ConfigStoreError::PersistSerialize {
+                graph: graph.as_str().to_string(),
+                reason: source.to_string(),
+            })?;
+
+        let file_path = dir.join(&rel);
+        persistence::atomic_write_with_backups(&file_path, &buf).map_err(|source| {
+            ConfigStoreError::PersistWrite {
+                graph: graph.as_str().to_string(),
+                path: file_path,
+                source,
+            }
+        })
     }
 
     /// The filesystem path this store was opened at.
@@ -447,7 +573,7 @@ impl ConfigStore {
             object.clone(),
             GraphName::NamedNode(graph.clone()),
         ))?;
-        Ok(())
+        self.persist_graph(graph)
     }
 
     /// Write one quad, refusing to target [`PRODUCT_GRAPH`] (contreforts-workspace#58 D6; #19
@@ -474,7 +600,7 @@ impl ConfigStore {
             object.clone(),
             GraphName::NamedNode(graph.clone()),
         ))?;
-        Ok(())
+        self.persist_graph(graph)
     }
 
     /// Rebuild [`PRODUCT_GRAPH`] from `ttl`, replacing whatever it held before
@@ -547,6 +673,7 @@ impl ConfigStore {
 
         self.store.clear_graph(graph)?;
         self.store.extend(quads)?;
+        self.persist_graph(graph)?;
         self.named_graph_len(graph)
     }
 
@@ -561,6 +688,7 @@ impl ConfigStore {
         self.reject_non_replaceable_graph(graph)?;
         let removed = self.named_graph_len(graph)?;
         self.store.clear_graph(graph)?;
+        self.persist_graph(graph)?;
         Ok(removed)
     }
 
