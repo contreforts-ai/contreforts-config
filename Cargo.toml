@@ -18,14 +18,12 @@ legacy-combined-store-migration = ["oxigraph/rocksdb"]
 
 [dependencies]
 # The store itself -- contreforts-workspace#18's design gives configuration its
-# own Oxigraph runtime, independent of contreforts-kg's. Not `{ workspace = true }`: the
-# workspace's own `oxigraph = "0.5"` entry doesn't disable oxigraph's default `rocksdb` feature
-# (Cargo forbids a dependent overriding `default-features` unless the workspace entry itself
-# sets `default-features = false`), and this crate has been asked to stop shipping that
-# dependency -- `ConfigStore` opens no RocksDB-backed `Store` anywhere (see `src/persistence.rs`).
-# Pinned to the same "0.5" the workspace uses, with RocksDB off outright rather than merely
-# optional.
-oxigraph = { version = "0.5", default-features = false }
+# own Oxigraph runtime, independent of contreforts-kg's. `default-features = false` at the
+# workspace root already keeps oxigraph's default `rocksdb` feature (and its `oxrocksdb-sys`
+# `cmake`/C++ toolchain dependency) off here -- `ConfigStore` opens no RocksDB-backed `Store`
+# anywhere (see `src/persistence.rs`). The `legacy-combined-store-migration` feature above
+# re-enables it, scoped to that one opt-in case.
+oxigraph = { workspace = true }
 # Named error for an unusable store path (contreforts-workspace#58 D2) -- no
 # panic, no silent fallback to a temp or current directory.
 thiserror = { workspace = true }
