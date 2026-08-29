@@ -169,6 +169,17 @@ pub(crate) fn load_graph_with_recovery(
                 path: path.to_path_buf(),
                 source,
             })?;
+            // `path` itself is corrupt at this point, not a version worth keeping -- remove it
+            // before re-persisting so `atomic_write_with_backups`'s rotation never carries the
+            // corrupt file into `.bak.1` (which would both misrepresent it as the "most recent
+            // previous version" and evict a genuinely good generation from `.bak.5` a cycle
+            // early). Already confirmed to exist by this function's own `path.exists()` guard
+            // above.
+            fs::remove_file(path).map_err(|source| ConfigStoreError::PersistWrite {
+                graph: graph.as_str().to_string(),
+                path: path.to_path_buf(),
+                source,
+            })?;
             atomic_write_with_backups(path, &recovered_bytes).map_err(|source| {
                 ConfigStoreError::PersistWrite {
                     graph: graph.as_str().to_string(),
