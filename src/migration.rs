@@ -25,10 +25,12 @@
 //! than silence -- it would devalue the loud, one-time logging the real migration path below
 //! genuinely needs. So [`MigrationOutcome::ConfigStoreAlreadyPopulated`] is a plain no-op: no
 //! `tracing` event at all on this path. Do not "fix" this into a warning.
+#[cfg(feature = "legacy-combined-store-migration")]
 use std::path::Path;
 
 use oxigraph::model::{NamedNode, Quad};
 use oxigraph::store::Store;
+#[cfg(feature = "legacy-combined-store-migration")]
 use tracing::info;
 
 use contreforts_core::namespaces::CONFIG_GRAPH;
@@ -90,6 +92,11 @@ pub enum MigrationOutcome {
 /// - [`ConfigStoreError::Open`] if a store exists at `combined_store_path` but cannot be opened.
 /// - [`ConfigStoreError::Storage`] if reading or writing quads fails.
 /// - [`ConfigStoreError::ConfigGraphCopyIncomplete`] if verification finds the copy incomplete.
+///
+/// Gated behind the `legacy-combined-store-migration` Cargo feature (off by default): reading
+/// `combined_store_path` needs oxigraph's RocksDB backend, which this crate otherwise no longer
+/// links (see `crate::persistence`'s module doc).
+#[cfg(feature = "legacy-combined-store-migration")]
 pub fn migrate_config_graph_if_needed(
     combined_store_path: impl AsRef<Path>,
     config_store: &ConfigStore,
@@ -143,6 +150,151 @@ pub fn migrate_config_graph_if_needed(
     Ok(MigrationOutcome::Migrated { triples_copied })
 }
 
+/// Migrate every graph a *pre-existing*, **RocksDB-backed** config-store datadir holds -- the
+/// format [`ConfigStore::open`] itself used before contreforts-config#22 replaced it with the
+/// per-graph Turtle-file persistence in [`crate::persistence`] -- into that new format, at the
+/// same path, exactly once.
+///
+/// Distinct from [`migrate_config_graph_if_needed`] above: that migration copies `CONFIG_GRAPH`
+/// out of contreforts-kg's *combined* store, a different physical store this crate never wrote
+/// to itself. This one recovers a `ConfigStore`'s **own** prior on-disk format at its own path --
+/// the far more common case, since every real `ConfigStore` deployment that existed before this
+/// crate dropped RocksDB has one, whether or not it ever also ran the combined-store migration.
+/// Without this, the moment a binary upgrades, that data does not error and does not merge -- it
+/// simply never loads, because [`ConfigStore::open`]'s `Store::new()` starts empty and no
+/// `config_graph.ttl` exists yet at that path. This crate's recurring rule
+/// (contreforts-workspace#18) applies here exactly as it does everywhere else: configuration is
+/// hand-entered and not re-derivable, so this must never be a silent, undetected data loss.
+///
+/// # What this does, in order
+///
+/// 1. If `config_store` already holds any `CONFIG_GRAPH` triple (real Turtle-file content, since
+///    this must always be called *after* [`ConfigStore::open`]'s own load has already happened),
+///    this is a no-op -- [`MigrationOutcome::ConfigStoreAlreadyPopulated`]. A fresh `open` cannot
+///    otherwise tell "empty legacy RocksDB store" apart from "never configured", so this check is
+///    what makes this migration idempotent.
+/// 2. If `config_store.path()` names no directory, or that directory holds no RocksDB `CURRENT`
+///    file -- oxigraph's own on-disk backend's marker of a real RocksDB database, and a plain,
+///    dependency-free way to test for one without paying to open it first -- this is
+///    [`MigrationOutcome::NothingToMigrate`]: no such legacy store exists at this path.
+/// 3. Otherwise the RocksDB store at that same path is opened just long enough to copy every
+///    quad from [`contreforts_core::namespaces::CONFIG_GRAPH`] and every graph named under
+///    [`crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX`] -- **not** every graph the legacy store happens
+///    to hold, so a stale [`crate::PRODUCT_GRAPH`] copy (rebuilt from compiled-in Turtle at every
+///    startup regardless, via [`crate::ConfigStore::reload_product_graph`]) is never carried
+///    forward. The handle is dropped immediately afterward: oxigraph's on-disk backend cannot
+///    hold two live handles on one path in one process, and nothing here ever writes back to
+///    it -- copy, never move, so the RocksDB files are left on disk as this migration's own
+///    rollback, exactly like [`migrate_config_graph_if_needed`]'s.
+/// 4. If nothing was found under either graph class, this is
+///    [`MigrationOutcome::NothingToMigrate`].
+/// 5. Otherwise the copied quads are inserted into `config_store`'s in-memory store and persisted
+///    to their new Turtle files, one [`crate::ConfigStore::persist_graph`] call per migrated
+///    graph -- so a crash between reading the legacy store and finishing this step leaves either
+///    nothing migrated (a rerun is safe: step 1 will not yet see it as populated) or a fully
+///    migrated set of Turtle files, never a partially-written one.
+/// 6. Logged at `info`, naming the path, the graph count and the total triple count copied -- the
+///    one path that genuinely needs to be loud -- and [`MigrationOutcome::Migrated`] returned.
+///
+/// # Errors
+///
+/// - [`ConfigStoreError::Open`] if a RocksDB store exists at this path but cannot be opened.
+/// - [`ConfigStoreError::Storage`] if reading its quads fails.
+/// - Any error [`crate::ConfigStore::persist_graph`] itself returns, if writing a migrated
+///   graph's new Turtle file fails.
+///
+/// Gated behind the `legacy-combined-store-migration` feature, same as
+/// [`migrate_config_graph_if_needed`]: reading the legacy RocksDB store needs oxigraph's RocksDB
+/// backend, which this crate otherwise no longer links.
+#[cfg(feature = "legacy-combined-store-migration")]
+pub fn migrate_rocksdb_datadir_if_needed(
+    config_store: &ConfigStore,
+) -> Result<MigrationOutcome, ConfigStoreError> {
+    if config_graph_is_populated(config_store.inner())? {
+        return Ok(MigrationOutcome::ConfigStoreAlreadyPopulated);
+    }
+
+    let Some(path) = config_store.path() else {
+        return Ok(MigrationOutcome::NothingToMigrate);
+    };
+
+    if !path.join("CURRENT").is_file() {
+        return Ok(MigrationOutcome::NothingToMigrate);
+    }
+
+    let quads_by_graph = {
+        let legacy_store = open_store(path)?;
+        let quads = migratable_quads(&legacy_store)?;
+        // Release this handle before config_store.persist_graph (indirectly, via this
+        // function's caller reopening the same path elsewhere) could ever need it -- the
+        // on-disk backend cannot hold two live handles on one path in one process, the same
+        // constraint migrate_config_graph_if_needed's own reopen dance works around above.
+        drop(legacy_store);
+        quads
+    };
+
+    if quads_by_graph.is_empty() {
+        return Ok(MigrationOutcome::NothingToMigrate);
+    }
+
+    let mut triples_copied = 0;
+    for (graph, quads) in &quads_by_graph {
+        triples_copied += quads.len();
+        config_store.inner().extend(quads.clone())?;
+        config_store.persist_graph(graph)?;
+    }
+
+    info!(
+        path = %path.display(),
+        graphs = quads_by_graph.len(),
+        triples_copied,
+        "config-store migration: recovered and persisted {triples_copied} triple(s) across {} \
+         graph(s) from the pre-existing RocksDB-backed store at {} -- its files are left \
+         untouched on disk",
+        quads_by_graph.len(),
+        path.display(),
+    );
+
+    Ok(MigrationOutcome::Migrated { triples_copied })
+}
+
+/// Every quad in `store` worth carrying into the new per-graph Turtle persistence, grouped by
+/// graph: [`contreforts_core::namespaces::CONFIG_GRAPH`] and every graph named under
+/// [`crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX`] -- deliberately not every graph the store holds; see
+/// [`migrate_rocksdb_datadir_if_needed`]'s doc comment for why [`crate::PRODUCT_GRAPH`] must be
+/// excluded. Graphs with no quads are omitted entirely, so an empty legacy store (or one holding
+/// only excluded graphs) yields an empty result rather than a set of zero-triple entries.
+#[cfg(feature = "legacy-combined-store-migration")]
+fn migratable_quads(store: &Store) -> Result<Vec<(NamedNode, Vec<Quad>)>, ConfigStoreError> {
+    use crate::IMPORTED_ONTOLOGY_GRAPH_PREFIX;
+    use oxigraph::model::NamedOrBlankNode;
+
+    let mut result = Vec::new();
+    for graph_name in store.named_graphs() {
+        let graph = match graph_name.map_err(ConfigStoreError::Storage)? {
+            NamedOrBlankNode::NamedNode(node) => node,
+            // A legacy store cannot have written config data into a blank-node-named graph
+            // through anything this crate's own engine ever exposed -- skip rather than error,
+            // since this migration only ever wants CONFIG_GRAPH and ontology graphs by name.
+            NamedOrBlankNode::BlankNode(_) => continue,
+        };
+        let is_migratable = graph.as_str() == CONFIG_GRAPH
+            || graph.as_str().starts_with(IMPORTED_ONTOLOGY_GRAPH_PREFIX);
+        if !is_migratable {
+            continue;
+        }
+
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some((&graph).into()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ConfigStoreError::Storage)?;
+        if !quads.is_empty() {
+            result.push((graph, quads));
+        }
+    }
+    Ok(result)
+}
+
 /// Verify that every `CONFIG_GRAPH` triple in `source` is also present in `config_store`'s own
 /// `CONFIG_GRAPH`, returning the number found. Exposed separately from
 /// [`migrate_config_graph_if_needed`] (which calls this internally, right after copying) so it
@@ -188,6 +340,7 @@ fn config_graph_quads(store: &Store) -> Result<Vec<Quad>, ConfigStoreError> {
 
 /// Whether `store` holds any `CONFIG_GRAPH` triple at all -- deliberately not "is the whole
 /// store empty" (see this module's top doc comment for why).
+#[cfg(feature = "legacy-combined-store-migration")]
 fn config_graph_is_populated(store: &Store) -> Result<bool, ConfigStoreError> {
     let graph = config_graph_name();
     match store
@@ -205,10 +358,12 @@ fn config_graph_name() -> NamedNode {
 }
 
 /// Open a store at `path`, mapping a failure onto the same [`ConfigStoreError::Open`] shape
-/// [`ConfigStore::open`] itself uses.
+/// [`ConfigStore::open`] itself uses. Requires the `legacy-combined-store-migration` feature --
+/// see [`migrate_config_graph_if_needed`]'s doc comment.
+#[cfg(feature = "legacy-combined-store-migration")]
 fn open_store(path: &Path) -> Result<Store, ConfigStoreError> {
     Store::open(path).map_err(|source| ConfigStoreError::Open {
         path: path.to_path_buf(),
-        source,
+        source: std::io::Error::other(source),
     })
 }

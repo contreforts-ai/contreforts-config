@@ -1039,6 +1039,7 @@ fn insert_in_named_graph(
     predicate: &NamedNode,
     object: &Term,
     graph: &NamedNode,
+    persist: bool,
 ) -> Result<()> {
     store.inner().insert(&Quad::new(
         subject.clone(),
@@ -1046,6 +1047,9 @@ fn insert_in_named_graph(
         object.clone(),
         GraphName::NamedNode(graph.clone()),
     ))?;
+    if persist {
+        store.persist_graph(graph)?;
+    }
     Ok(())
 }
 
@@ -1107,6 +1111,7 @@ fn remove_subject_from_named_graph(
     for quad in quads {
         store.inner().remove(&quad)?;
     }
+    store.persist_graph(graph)?;
     Ok(())
 }
 
@@ -1130,6 +1135,7 @@ fn remove_subject_from_named_graph_except(
     subject: &NamedNode,
     graph: &NamedNode,
     keep: &[&NamedNode],
+    persist: bool,
 ) -> Result<()> {
     let quads: Vec<_> = store
         .inner()
@@ -1140,6 +1146,9 @@ fn remove_subject_from_named_graph_except(
             continue;
         }
         store.inner().remove(&quad)?;
+    }
+    if persist {
+        store.persist_graph(graph)?;
     }
     Ok(())
 }
@@ -1157,6 +1166,7 @@ fn remove_subject_predicate_from_named_graph(
     subject: &NamedNode,
     predicate: &NamedNode,
     graph: &NamedNode,
+    persist: bool,
 ) -> Result<()> {
     let quads: Vec<_> = store
         .inner()
@@ -1169,6 +1179,9 @@ fn remove_subject_predicate_from_named_graph(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for quad in quads {
         store.inner().remove(&quad)?;
+    }
+    if persist {
+        store.persist_graph(graph)?;
     }
     Ok(())
 }
@@ -1275,7 +1288,21 @@ impl<'a> ConfigGraph<'a> {
 
     fn write_triple(&self, subject: &NamedNode, predicate_iri: &str, object: Term) -> Result<()> {
         let pred = self.node(predicate_iri)?;
-        insert_in_named_graph(self.store, subject, &pred, &object, &self.graph)
+        insert_in_named_graph(self.store, subject, &pred, &object, &self.graph, true)
+    }
+
+    /// `write_triple` without the per-call [`crate::ConfigStore::persist_graph`] -- for a caller
+    /// that is about to make several such writes to `self.graph` (always the same physical file,
+    /// see [`ConfigGraph`]'s `graph` field) and persist once itself after the last one, instead of
+    /// re-serializing and re-persisting the whole graph after every single triple.
+    fn write_triple_no_persist(
+        &self,
+        subject: &NamedNode,
+        predicate_iri: &str,
+        object: Term,
+    ) -> Result<()> {
+        let pred = self.node(predicate_iri)?;
+        insert_in_named_graph(self.store, subject, &pred, &object, &self.graph, false)
     }
 
     /// Writes one field's literal, typed from `datatype_iri` when the declaration supplies one
@@ -1292,6 +1319,18 @@ impl<'a> ConfigGraph<'a> {
     ) -> Result<()> {
         let literal = self.typed_literal(value, datatype_iri)?;
         self.write_triple(subject, predicate_iri, Term::Literal(literal))
+    }
+
+    /// `write_literal` without the per-call persist -- see [`Self::write_triple_no_persist`].
+    fn write_literal_no_persist(
+        &self,
+        subject: &NamedNode,
+        predicate_iri: &str,
+        value: &str,
+        datatype_iri: Option<&str>,
+    ) -> Result<()> {
+        let literal = self.typed_literal(value, datatype_iri)?;
+        self.write_triple_no_persist(subject, predicate_iri, Term::Literal(literal))
     }
 
     /// Builds one field's literal term: `Literal::new_typed_literal(value, datatype)` when
@@ -1311,6 +1350,12 @@ impl<'a> ConfigGraph<'a> {
     fn write_type(&self, subject: &NamedNode, type_iri: &str) -> Result<()> {
         let type_node = self.node(type_iri)?;
         self.write_triple(subject, &format!("{RDF}type"), Term::NamedNode(type_node))
+    }
+
+    /// `write_type` without the per-call persist -- see [`Self::write_triple_no_persist`].
+    fn write_type_no_persist(&self, subject: &NamedNode, type_iri: &str) -> Result<()> {
+        let type_node = self.node(type_iri)?;
+        self.write_triple_no_persist(subject, &format!("{RDF}type"), Term::NamedNode(type_node))
     }
 
     /// Resolve `descriptor.kind`'s `ConnectorNamespace` -- case 1 (declared) when
@@ -1483,6 +1528,7 @@ impl<'a> ConfigGraph<'a> {
                         &conn_node,
                         &pred,
                         &self.graph,
+                        false,
                     )?;
                 }
             }
@@ -1503,20 +1549,27 @@ impl<'a> ConfigGraph<'a> {
                     &conn_node,
                     &self.graph,
                     &[&target_kb],
+                    false,
                 )?;
             }
         }
 
-        self.write_type(&conn_node, &type_iri)?;
+        // Every delete and write above targets `self.graph` in-memory only (`persist: false` /
+        // `_no_persist`) -- a single `persist_graph` call below, once every mutation this call
+        // makes is applied, replaces what used to be one full graph dump + atomic write + backup
+        // rotation per deleted predicate and per written field.
+        self.write_type_no_persist(&conn_node, &type_iri)?;
         for (predicate_iri, value, datatype_iri) in &resolved_fields {
-            self.write_literal(&conn_node, predicate_iri, value, *datatype_iri)?;
+            self.write_literal_no_persist(&conn_node, predicate_iri, value, *datatype_iri)?;
         }
-
-        self.write_triple(
+        self.write_triple_no_persist(
             &company_node,
             &format!("{CORE_NS}hasConnector"),
             Term::NamedNode(conn_node),
-        )
+        )?;
+
+        self.store.persist_graph(&self.graph)?;
+        Ok(())
     }
 
     /// Builds the small RDF graph a `write_connector` call is about to write for one
